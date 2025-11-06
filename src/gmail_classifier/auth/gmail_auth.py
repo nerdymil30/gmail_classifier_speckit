@@ -1,6 +1,7 @@
 """Gmail OAuth2 authentication flow."""
 
 import os
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -9,7 +10,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from gmail_classifier.lib.config import Config
+from gmail_classifier.lib.config import gmail_config, storage_config
 from gmail_classifier.lib.logger import get_logger
 
 logger = get_logger(__name__)
@@ -33,8 +34,8 @@ class GmailAuthenticator:
             credentials_path: Path to credentials.json from Google Cloud Console
             scopes: Gmail API scopes to request
         """
-        self.credentials_path = credentials_path or Config.get_credentials_path()
-        self.scopes = scopes or Config.GMAIL_SCOPES
+        self.credentials_path = credentials_path or storage_config.get_credentials_path()
+        self.scopes = scopes or gmail_config.scopes
         self.creds: Optional[Credentials] = None
 
     def authenticate(self, force_reauth: bool = False) -> Credentials:
@@ -62,6 +63,9 @@ class GmailAuthenticator:
                 "4. Download JSON and save as credentials.json"
             )
 
+        # Check credentials.json permissions
+        self._check_credentials_permissions()
+
         # Try to load existing credentials from keyring
         if not force_reauth:
             self.creds = self._load_credentials_from_keyring()
@@ -88,24 +92,56 @@ class GmailAuthenticator:
 
     def _perform_oauth_flow(self) -> Credentials:
         """
-        Perform OAuth2 authentication flow.
+        Perform OAuth2 authentication flow with CSRF protection.
 
         Returns:
             Valid credentials object
+
+        Raises:
+            ValueError: If state parameter validation fails (CSRF attack detected)
         """
+        # Generate cryptographically secure state token for CSRF protection
+        state = secrets.token_urlsafe(32)
+
         flow = InstalledAppFlow.from_client_secrets_file(
             str(self.credentials_path),
             scopes=self.scopes,
+            state=state,  # Add state parameter for CSRF protection
         )
 
         # Run local server to handle OAuth callback
         creds = flow.run_local_server(
-            port=8080,
+            port=0,  # Let OS assign random available port (security: prevents port hijacking)
             prompt="consent",
             success_message="Authentication successful! You can close this window.",
         )
 
+        # Validate state parameter to prevent CSRF attacks
+        if flow.state != state:
+            raise ValueError(
+                "OAuth state mismatch detected. Possible CSRF attack. "
+                "Please try authenticating again."
+            )
+
         return creds
+
+    def _check_credentials_permissions(self) -> None:
+        """
+        Check credentials.json file permissions and warn/fix if insecure.
+
+        Checks if credentials.json has permissions that allow group or
+        others to read the file, which would expose OAuth client secrets.
+        """
+        import os
+        import stat
+
+        from gmail_classifier.lib.utils import ensure_secure_file
+
+        if not self.credentials_path.exists():
+            return
+
+        # Use utility function to check and fix permissions
+        ensure_secure_file(self.credentials_path, mode=0o600)
 
     def _load_credentials_from_keyring(self) -> Optional[Credentials]:
         """
@@ -124,6 +160,9 @@ class GmailAuthenticator:
             # Reconstruct credentials from refresh token
             # Note: This requires client_id and client_secret from credentials.json
             import json
+
+            # Check credentials.json permissions before reading
+            self._check_credentials_permissions()
 
             with open(self.credentials_path) as f:
                 creds_data = json.load(f)
@@ -202,60 +241,3 @@ def get_gmail_credentials(force_reauth: bool = False) -> Credentials:
     """
     authenticator = GmailAuthenticator()
     return authenticator.authenticate(force_reauth=force_reauth)
-
-
-def setup_claude_api_key(api_key: str) -> None:
-    """
-    Store Claude API key in system keyring.
-
-    Args:
-        api_key: Anthropic API key
-    """
-    keyring.set_password("gmail_classifier", "anthropic_api_key", api_key)
-    logger.info("Claude API key stored securely in keyring")
-
-
-def get_claude_api_key() -> Optional[str]:
-    """
-    Retrieve Claude API key from keyring or environment.
-
-    Returns:
-        API key if found, None otherwise
-    """
-    # Try keyring first
-    api_key = keyring.get_password("gmail_classifier", "anthropic_api_key")
-
-    # Fallback to environment variable
-    if not api_key:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-
-    return api_key
-
-
-def validate_claude_api_key(api_key: str) -> bool:
-    """
-    Validate Claude API key by making a test request.
-
-    Args:
-        api_key: API key to validate
-
-    Returns:
-        True if key is valid
-    """
-    try:
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=api_key)
-
-        # Make a minimal test request
-        client.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=10,
-            messages=[{"role": "user", "content": "test"}],
-        )
-
-        return True
-
-    except Exception as e:
-        logger.error(f"Claude API key validation failed: {e}")
-        return False

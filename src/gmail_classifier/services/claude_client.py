@@ -6,10 +6,11 @@ from typing import List, Optional
 
 import anthropic
 
-from gmail_classifier.auth.gmail_auth import get_claude_api_key
-from gmail_classifier.lib.config import Config
+from gmail_classifier.auth.claude_auth import get_claude_api_key
+from gmail_classifier.lib.cache import ClassificationCache
+from gmail_classifier.lib.config import claude_config, cache_config
 from gmail_classifier.lib.logger import get_logger
-from gmail_classifier.lib.utils import Timer, get_confidence_category
+from gmail_classifier.lib.utils import Timer, get_confidence_category, rate_limit
 from gmail_classifier.models.email import Email
 from gmail_classifier.models.label import Label
 from gmail_classifier.models.suggestion import ClassificationSuggestion, SuggestedLabel
@@ -40,10 +41,12 @@ class ClaudeClient:
             )
 
         self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.model = Config.CLAUDE_MODEL
+        self.model = claude_config.model
+        self.cache = ClassificationCache()
 
         logger.info(f"Claude API client initialized with model {self.model}")
 
+    @rate_limit(calls_per_second=claude_config.api_rate_limit)
     def classify_email(
         self,
         email: Email,
@@ -67,6 +70,19 @@ class ClaudeClient:
                 # Prepare label list for Claude
                 label_names = [label.name for label in available_labels]
 
+                # Try cache first
+                cached = self.cache.get(
+                    email.content,
+                    label_names,
+                    max_age_hours=cache_config.classification_max_age_hours
+                )
+
+                if cached:
+                    # Update email_id (cached suggestion has old ID)
+                    cached.email_id = email.id
+                    logger.info(f"Cache hit for email {email.id}")
+                    return cached
+
                 # Construct classification prompt
                 prompt = self._build_classification_prompt(email, label_names)
 
@@ -89,6 +105,10 @@ class ClaudeClient:
                     available_labels,
                 )
 
+                # Cache result
+                self.cache.set(email.content, label_names, suggestion)
+                logger.debug(f"Cached classification for email {email.id}")
+
                 logger.info(
                     f"Classified email {email.id}: "
                     f"{suggestion.confidence_category} confidence"
@@ -104,6 +124,7 @@ class ClaudeClient:
                 reasoning=f"Classification failed: {str(e)}",
             )
 
+    @rate_limit(calls_per_second=claude_config.api_rate_limit)
     def classify_batch(
         self,
         emails: List[Email],
@@ -125,9 +146,35 @@ class ClaudeClient:
         try:
             with Timer(f"classify_batch_{len(emails)}_emails"):
                 label_names = [label.name for label in available_labels]
+                suggestions = []
+                emails_to_classify = []
+                email_index_map = {}
 
-                # Build batch classification prompt
-                prompt = self._build_batch_classification_prompt(emails, label_names)
+                # Check cache for each email
+                for i, email in enumerate(emails):
+                    cached = self.cache.get(
+                        email.content,
+                        label_names,
+                        max_age_hours=cache_config.classification_max_age_hours
+                    )
+
+                    if cached:
+                        # Update email_id (cached suggestion has old ID)
+                        cached.email_id = email.id
+                        suggestions.append(cached)
+                        logger.debug(f"Cache hit for email {email.id}")
+                    else:
+                        # Track emails that need classification
+                        email_index_map[len(emails_to_classify)] = i
+                        emails_to_classify.append(email)
+
+                # If all emails were cached, return early
+                if not emails_to_classify:
+                    logger.info(f"All {len(emails)} emails found in cache")
+                    return suggestions
+
+                # Build batch classification prompt for uncached emails
+                prompt = self._build_batch_classification_prompt(emails_to_classify, label_names)
 
                 # Call Claude API
                 response = self.client.messages.create(
@@ -141,18 +188,25 @@ class ClaudeClient:
                 response_text = response.content[0].text
                 batch_data = self._parse_batch_classification_response(response_text)
 
-                # Create suggestions
-                suggestions = []
+                # Create suggestions for newly classified emails
                 for email_data in batch_data:
-                    email_id = emails[email_data["email_index"]].id
+                    batch_index = email_data["email_index"]
+                    email = emails_to_classify[batch_index]
                     suggestion = self._create_suggestion_from_response(
-                        email_id,
+                        email.id,
                         email_data,
                         available_labels,
                     )
                     suggestions.append(suggestion)
 
-                logger.info(f"Classified batch of {len(suggestions)} emails")
+                    # Cache result
+                    self.cache.set(email.content, label_names, suggestion)
+                    logger.debug(f"Cached classification for email {email.id}")
+
+                logger.info(
+                    f"Classified batch of {len(suggestions)} emails "
+                    f"({len(emails_to_classify)} from API, {len(emails) - len(emails_to_classify)} from cache)"
+                )
 
                 return suggestions
 

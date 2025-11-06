@@ -1,16 +1,15 @@
 """Email classifier service orchestrating Gmail and Claude APIs."""
 
-from typing import List, Optional
+import json
+from datetime import UTC, datetime
+from pathlib import Path
 
 from gmail_classifier.auth.gmail_auth import get_gmail_credentials
-from gmail_classifier.lib.config import Config
+from gmail_classifier.lib.config import claude_config, storage_config
 from gmail_classifier.lib.logger import get_structured_logger
 from gmail_classifier.lib.session_db import SessionDatabase
 from gmail_classifier.lib.utils import batch_items
-from gmail_classifier.models.email import Email
-from gmail_classifier.models.label import Label
 from gmail_classifier.models.session import ProcessingSession
-from gmail_classifier.models.suggestion import ClassificationSuggestion
 from gmail_classifier.services.claude_client import ClaudeClient
 from gmail_classifier.services.gmail_client import GmailClient
 
@@ -26,9 +25,9 @@ class EmailClassifier:
 
     def __init__(
         self,
-        gmail_client: Optional[GmailClient] = None,
-        claude_client: Optional[ClaudeClient] = None,
-        session_db: Optional[SessionDatabase] = None,
+        gmail_client: GmailClient | None = None,
+        claude_client: ClaudeClient | None = None,
+        session_db: SessionDatabase | None = None,
     ):
         """
         Initialize email classifier.
@@ -55,22 +54,24 @@ class EmailClassifier:
 
     def classify_unlabeled_emails(
         self,
-        max_emails: Optional[int] = None,
+        max_emails: int | None = None,
         dry_run: bool = True,
+        page_size: int = 100,
     ) -> ProcessingSession:
         """
-        Classify unlabeled emails in user's Gmail account.
+        Classify unlabeled emails in user's Gmail account using pagination.
 
         Args:
             max_emails: Maximum number of emails to process (None = all)
             dry_run: If True, generate suggestions but don't apply labels
+            page_size: Number of emails to fetch per page (default 100)
 
         Returns:
             ProcessingSession with results
         """
         logger.info(
             f"Starting classification run: "
-            f"max_emails={max_emails}, dry_run={dry_run}"
+            f"max_emails={max_emails}, dry_run={dry_run}, page_size={page_size}"
         )
 
         # Get user profile
@@ -88,81 +89,142 @@ class EmailClassifier:
                 "Please create at least 3-5 labels with some labeled emails first."
             )
 
-        logger.info(f"Found {len(user_labels)} user labels: {[l.name for l in user_labels]}")
+        logger.info(f"Found {len(user_labels)} user labels: {[label.name for label in user_labels]}")
 
-        # Fetch unlabeled emails
-        logger.info("Fetching unlabeled emails")
-        unlabeled_emails = self.gmail_client.get_unlabeled_emails(max_results=max_emails)
+        # Get total count for progress tracking
+        total_unlabeled = self.gmail_client.count_unlabeled_emails()
+        total_to_process = min(total_unlabeled, max_emails) if max_emails else total_unlabeled
 
-        if not unlabeled_emails:
+        if total_to_process == 0:
             logger.info("No unlabeled emails found")
             return self._create_empty_session(user_email, dry_run)
 
-        logger.info(f"Found {len(unlabeled_emails)} unlabeled emails to classify")
+        logger.info(f"Found approximately {total_unlabeled} unlabeled emails, processing up to {total_to_process}")
 
         # Create processing session
         session = ProcessingSession.create_new(
             user_email=user_email,
-            total_emails=len(unlabeled_emails),
-            config={"dry_run": dry_run, "max_emails": max_emails},
+            total_emails=total_to_process,
+            config={"dry_run": dry_run, "max_emails": max_emails, "page_size": page_size},
         )
 
         self.session_db.save_session(session)
         logger.set_context(session_id=session.id)
 
-        # Process emails in batches
-        batch_size = Config.BATCH_SIZE
-        email_batches = batch_items(unlabeled_emails, batch_size)
+        # Process emails in pages
+        processed = 0
+        page_token = None
+        page_num = 0
 
-        logger.info(f"Processing {len(unlabeled_emails)} emails in {len(email_batches)} batches")
+        while True:
+            # Check if we've hit max_emails limit
+            if max_emails and processed >= max_emails:
+                logger.info(f"Reached max_emails limit: {max_emails}")
+                break
 
-        for batch_idx, email_batch in enumerate(email_batches, 1):
-            logger.info(f"Processing batch {batch_idx}/{len(email_batches)}")
+            # Calculate page size for this iteration
+            remaining = max_emails - processed if max_emails else page_size
+            current_page_size = min(page_size, remaining)
+
+            # Fetch one page of message IDs
+            page_num += 1
+            logger.info(f"Fetching page {page_num} of up to {current_page_size} emails")
+
+            message_ids, next_page_token = self.gmail_client.list_unlabeled_messages(
+                max_results=current_page_size,
+                page_token=page_token,
+            )
+
+            if not message_ids:
+                logger.info("No more unlabeled emails found")
+                break
+
+            logger.info(f"Retrieved {len(message_ids)} message IDs from page {page_num}")
 
             try:
-                # Classify batch
-                suggestions = self.claude_client.classify_batch(email_batch, user_labels)
+                # Fetch full messages using batch API
+                emails = self.gmail_client.get_messages_batch(message_ids)
 
-                # Save suggestions to database
-                for suggestion in suggestions:
-                    self.session_db.save_suggestion(session.id, suggestion)
-                    session.increment_generated()
+                # Filter to only truly unlabeled emails
+                unlabeled_emails = [email for email in emails if email.is_unlabeled]
 
-                    # Log classification result
-                    if suggestion.best_suggestion:
-                        logger.log_classification(
-                            email_id=suggestion.email_id,
-                            suggested_label=suggestion.best_suggestion.label_name,
-                            confidence=suggestion.best_suggestion.confidence_score,
-                            reasoning=suggestion.reasoning,
+                if not unlabeled_emails:
+                    logger.info("No unlabeled emails in this page, continuing to next page")
+                    processed += len(message_ids)
+                    page_token = next_page_token
+
+                    # Break if no more pages
+                    if not page_token:
+                        break
+                    continue
+
+                logger.info(f"Processing {len(unlabeled_emails)} unlabeled emails from page {page_num}")
+
+                # Process emails in smaller batches for Claude API
+                batch_size = claude_config.batch_size
+                email_batches = batch_items(unlabeled_emails, batch_size)
+
+                for batch_idx, email_batch in enumerate(email_batches, 1):
+                    logger.debug(f"Processing Claude batch {batch_idx}/{len(email_batches)} from page {page_num}")
+
+                    # Classify batch with Claude
+                    suggestions = self.claude_client.classify_batch(email_batch, user_labels)
+
+                    # Save suggestions to database
+                    for suggestion in suggestions:
+                        self.session_db.save_suggestion(session.id, suggestion)
+                        session.increment_generated()
+
+                        # Log classification result
+                        if suggestion.best_suggestion:
+                            logger.log_classification(
+                                email_id=suggestion.email_id,
+                                suggested_label=suggestion.best_suggestion.label_name,
+                                confidence=suggestion.best_suggestion.confidence_score,
+                                reasoning=suggestion.reasoning,
+                            )
+                        else:
+                            logger.log_classification(
+                                email_id=suggestion.email_id,
+                                suggested_label="No Match",
+                                confidence=0.0,
+                                reasoning=suggestion.reasoning,
+                            )
+
+                    # Update session progress
+                    session.emails_processed += len(email_batch)
+
+                    # Auto-save session every N emails
+                    if session.emails_processed % storage_config.auto_save_frequency == 0:
+                        self.session_db.save_session(session)
+                        logger.log_session_progress(
+                            session_id=session.id,
+                            processed=session.emails_processed,
+                            total=session.total_emails_to_process,
                         )
-                    else:
-                        logger.log_classification(
-                            email_id=suggestion.email_id,
-                            suggested_label="No Match",
-                            confidence=0.0,
-                            reasoning=suggestion.reasoning,
-                        )
 
-                # Update session progress
-                session.emails_processed += len(email_batch)
+                    # Free memory after processing batch
+                    del suggestions
 
-                # Auto-save session every N emails
-                if session.emails_processed % Config.AUTO_SAVE_FREQUENCY == 0:
-                    self.session_db.save_session(session)
-                    logger.log_session_progress(
-                        session_id=session.id,
-                        processed=session.emails_processed,
-                        total=session.total_emails_to_process,
-                    )
+                # Free memory before next page
+                del emails
+                del unlabeled_emails
 
             except Exception as e:
-                error_msg = f"Batch {batch_idx} classification failed: {e}"
+                error_msg = f"Page {page_num} classification failed: {e}"
                 logger.error(error_msg)
                 session.add_error(error_msg)
 
-                # For now, continue with remaining batches
+                # Continue with remaining pages
                 # In future, could add option to fail entire session
+
+            processed += len(message_ids)
+            page_token = next_page_token
+
+            # Break if no more pages
+            if not page_token:
+                logger.info("No more pages available")
+                break
 
         # Mark session as completed
         session.complete()
@@ -179,7 +241,7 @@ class EmailClassifier:
     def apply_suggestions(
         self,
         session_id: str,
-        min_confidence: Optional[float] = None,
+        min_confidence: float | None = None,
         auto_approve_high_confidence: bool = False,
     ) -> dict:
         """
@@ -212,7 +274,7 @@ class EmailClassifier:
             return {"applied": 0, "skipped": 0, "failed": 0}
 
         # Filter by confidence if specified
-        min_conf = min_confidence or Config.CONFIDENCE_THRESHOLD
+        min_conf = min_confidence or claude_config.confidence_threshold
 
         applicable_suggestions = [
             s
@@ -225,10 +287,11 @@ class EmailClassifier:
             f"meeting confidence threshold {min_conf}"
         )
 
-        # Apply labels
+        # Apply labels with compensating transaction pattern and audit logging
         applied = 0
         skipped = 0
         failed = 0
+        inconsistent = []
 
         for suggestion in applicable_suggestions:
             if not suggestion.best_suggestion:
@@ -236,34 +299,109 @@ class EmailClassifier:
                 continue
 
             try:
-                # Apply label to email
+                # Apply label to Gmail
                 success = self.gmail_client.add_label_to_message(
                     suggestion.email_id,
                     suggestion.best_suggestion.label_id,
                 )
 
+                # Log the Gmail operation immediately (audit trail)
+                timestamp = datetime.now(UTC).isoformat()
+                self.session_db.log_gmail_operation(
+                    operation_type="add_label",
+                    email_id=suggestion.email_id,
+                    label_id=suggestion.best_suggestion.label_id,
+                    success=success,
+                    timestamp=timestamp,
+                    session_id=session_id,
+                    error_message=None if success else "Gmail API returned False",
+                )
+
                 if success:
-                    # Update suggestion status
-                    suggestion.mark_applied()
-                    self.session_db.update_suggestion_status(
-                        session_id,
-                        suggestion.email_id,
-                        "applied",
-                    )
+                    # Try to update database (compensating transaction pattern)
+                    try:
+                        # Update suggestion status
+                        suggestion.mark_applied()
+                        self.session_db.update_suggestion_status(
+                            session_id,
+                            suggestion.email_id,
+                            "applied",
+                        )
 
-                    session.increment_applied()
-                    applied += 1
+                        session.increment_applied()
 
-                    logger.info(
-                        f"Applied label '{suggestion.best_suggestion.label_name}' "
-                        f"to email {suggestion.email_id}"
-                    )
+                        # Mark operation as synced in audit log
+                        self.session_db.mark_operation_synced(
+                            email_id=suggestion.email_id,
+                            label_id=suggestion.best_suggestion.label_id,
+                        )
+
+                        applied += 1
+
+                        logger.info(
+                            f"Applied label '{suggestion.best_suggestion.label_name}' "
+                            f"to email {suggestion.email_id}"
+                        )
+
+                    except Exception as db_error:
+                        # CRITICAL: Label applied to Gmail but DB update failed
+                        # This is an inconsistency that needs to be tracked
+                        logger.critical(
+                            f"INCONSISTENCY DETECTED: "
+                            f"Label applied to Gmail but DB update failed. "
+                            f"email_id={suggestion.email_id}, "
+                            f"label_id={suggestion.best_suggestion.label_id}, "
+                            f"label_name={suggestion.best_suggestion.label_name}, "
+                            f"error={db_error}"
+                        )
+                        inconsistent.append({
+                            "email_id": suggestion.email_id,
+                            "label_id": suggestion.best_suggestion.label_id,
+                            "label_name": suggestion.best_suggestion.label_name,
+                            "error": str(db_error),
+                            "timestamp": timestamp,
+                        })
+                        failed += 1
+                        continue
                 else:
                     failed += 1
 
-            except Exception as e:
-                logger.error(f"Failed to apply label to {suggestion.email_id}: {e}")
+            except Exception as gmail_error:
+                # Gmail API operation failed
+                logger.error(f"Failed to apply label to {suggestion.email_id}: {gmail_error}")
+
+                # Log the failed operation
+                self.session_db.log_gmail_operation(
+                    operation_type="add_label",
+                    email_id=suggestion.email_id,
+                    label_id=suggestion.best_suggestion.label_id,
+                    success=False,
+                    timestamp=datetime.now(UTC).isoformat(),
+                    session_id=session_id,
+                    error_message=str(gmail_error),
+                )
                 failed += 1
+
+        # Report inconsistencies to file for manual reconciliation
+        if inconsistent:
+            logger.error(
+                f"INCONSISTENT STATE: {len(inconsistent)} labels applied to Gmail "
+                f"but not recorded in database. Manual reconciliation required."
+            )
+
+            # Write inconsistency report to file
+            inconsistency_file = Path("gmail_db_inconsistencies.json")
+            try:
+                with open(inconsistency_file, "a") as f:
+                    json.dump({
+                        "timestamp": datetime.now(UTC).isoformat(),
+                        "session_id": session_id,
+                        "inconsistencies": inconsistent
+                    }, f)
+                    f.write("\n")
+                logger.error(f"Inconsistency report written to {inconsistency_file}")
+            except Exception as file_error:
+                logger.critical(f"Failed to write inconsistency report: {file_error}")
 
         # Save updated session
         self.session_db.save_session(session)
@@ -272,6 +410,7 @@ class EmailClassifier:
             "applied": applied,
             "skipped": skipped,
             "failed": failed,
+            "inconsistent": len(inconsistent),
             "total": len(applicable_suggestions),
         }
 

@@ -100,5 +100,8 @@ def pytest_configure(config):
         "markers", "integration: marks tests as integration tests (slower, may use real APIs)"
     )
     config.addinivalue_line(
+        "markers", "performance: marks tests as performance benchmarks (measure speed and memory)"
+    )
+    config.addinivalue_line(
         "markers", "slow: marks tests as slow running"
     )

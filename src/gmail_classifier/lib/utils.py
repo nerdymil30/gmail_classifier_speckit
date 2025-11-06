@@ -1,13 +1,16 @@
 """Utility functions for Gmail Classifier."""
 
+import os
 import random
+import stat
 import time
 from functools import wraps
+from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 
 from googleapiclient.errors import HttpError
 
-from gmail_classifier.lib.config import Config
+from gmail_classifier.lib.config import gmail_config, privacy_config
 from gmail_classifier.lib.logger import get_logger
 
 logger = get_logger(__name__)
@@ -27,10 +30,10 @@ def retry_with_exponential_backoff(
     Decorator for retrying functions with exponential backoff.
 
     Args:
-        max_retries: Maximum number of retry attempts (default: Config.MAX_RETRIES)
-        initial_delay: Initial delay in seconds (default: Config.INITIAL_BACKOFF)
-        max_delay: Maximum delay in seconds (default: Config.MAX_BACKOFF)
-        multiplier: Backoff multiplier (default: Config.BACKOFF_MULTIPLIER)
+        max_retries: Maximum number of retry attempts (default: gmail_config.max_retries)
+        initial_delay: Initial delay in seconds (default: gmail_config.initial_backoff)
+        max_delay: Maximum delay in seconds (default: gmail_config.max_backoff)
+        multiplier: Backoff multiplier (default: gmail_config.backoff_multiplier)
         jitter: Add random jitter to delays (default: True)
 
     Returns:
@@ -41,10 +44,10 @@ def retry_with_exponential_backoff(
         def fetch_data():
             return api.get_data()
     """
-    _max_retries = max_retries or Config.MAX_RETRIES
-    _initial_delay = initial_delay or Config.INITIAL_BACKOFF
-    _max_delay = max_delay or Config.MAX_BACKOFF
-    _multiplier = multiplier or Config.BACKOFF_MULTIPLIER
+    _max_retries = max_retries or gmail_config.max_retries
+    _initial_delay = initial_delay or gmail_config.initial_backoff
+    _max_delay = max_delay or gmail_config.max_backoff
+    _multiplier = multiplier or gmail_config.backoff_multiplier
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
         @wraps(func)
@@ -120,7 +123,7 @@ def rate_limit(calls_per_second: Optional[float] = None) -> Callable:
         def api_call():
             return api.fetch()
     """
-    delay = 1.0 / (calls_per_second or Config.GMAIL_QUOTA_UNITS_PER_SECOND)
+    delay = 1.0 / (calls_per_second or gmail_config.quota_units_per_second)
     last_call_time = [0.0]  # Use list to allow modification in nested function
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
@@ -319,3 +322,84 @@ class Timer:
         if self.elapsed is not None:
             return self.elapsed * 1000
         return 0.0
+
+
+def ensure_secure_file(file_path: Path, mode: int = 0o600) -> None:
+    """
+    Ensure file has secure permissions, fix if needed.
+
+    This function checks if a file has overly permissive permissions
+    (readable/writable by group or others) and fixes them to be
+    owner-only access.
+
+    Args:
+        file_path: Path to the file to secure
+        mode: Target permission mode (default: 0o600 - owner read/write only)
+
+    Example:
+        >>> ensure_secure_file(Path("credentials.json"))
+        # Ensures credentials.json has 600 permissions
+    """
+    if not file_path.exists():
+        # Create with secure permissions
+        file_path.touch(mode=mode)
+        logger.debug(f"Created {file_path} with secure permissions {oct(mode)}")
+        return
+
+    current_mode = stat.S_IMODE(os.stat(file_path).st_mode)
+
+    # Check if permissions are too permissive (group or others have any access)
+    if current_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        logger.warning(
+            f"Insecure permissions detected on {file_path}: {oct(current_mode)}. "
+            f"Fixing to {oct(mode)}."
+        )
+
+        # Auto-fix if enabled
+        if privacy_config.auto_fix_permissions:
+            os.chmod(file_path, mode)
+            logger.info(f"Fixed permissions on {file_path} to {oct(mode)}")
+        else:
+            logger.warning(
+                f"AUTO_FIX_PERMISSIONS is disabled. "
+                f"Please manually run: chmod {oct(mode)[-3:]} {file_path}"
+            )
+
+
+def ensure_secure_directory(dir_path: Path, mode: int = 0o700) -> None:
+    """
+    Ensure directory has secure permissions.
+
+    Creates the directory if it doesn't exist and ensures it has
+    owner-only permissions.
+
+    Args:
+        dir_path: Path to the directory to secure
+        mode: Target permission mode (default: 0o700 - owner access only)
+
+    Example:
+        >>> ensure_secure_directory(Path.home() / ".gmail_classifier")
+        # Ensures ~/.gmail_classifier has 700 permissions
+    """
+    # Create directory with secure permissions
+    dir_path.mkdir(parents=True, exist_ok=True, mode=mode)
+
+    # Verify and fix if needed (mkdir might be affected by umask)
+    current_mode = stat.S_IMODE(os.stat(dir_path).st_mode)
+
+    # Check if permissions are too permissive
+    if current_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        logger.warning(
+            f"Insecure permissions detected on directory {dir_path}: {oct(current_mode)}. "
+            f"Fixing to {oct(mode)}."
+        )
+
+        # Auto-fix if enabled
+        if privacy_config.auto_fix_permissions:
+            os.chmod(dir_path, mode)
+            logger.info(f"Fixed directory permissions on {dir_path} to {oct(mode)}")
+        else:
+            logger.warning(
+                f"AUTO_FIX_PERMISSIONS is disabled. "
+                f"Please manually run: chmod {oct(mode)[-3:]} {dir_path}"
+            )

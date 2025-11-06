@@ -4,13 +4,13 @@ import sys
 
 import click
 
-from gmail_classifier.auth.gmail_auth import (
+from gmail_classifier.auth import (
     GmailAuthenticator,
     get_claude_api_key,
     setup_claude_api_key,
     validate_claude_api_key,
 )
-from gmail_classifier.lib.config import Config
+from gmail_classifier.lib.config import storage_config, claude_config
 from gmail_classifier.lib.logger import get_logger
 from gmail_classifier.lib.session_db import SessionDatabase
 from gmail_classifier.services.classifier import EmailClassifier
@@ -333,11 +333,11 @@ def status():
     # Configuration
     click.echo()
     click.echo("Configuration:")
-    click.echo(f"  Data directory: {Config.HOME_DIR}")
-    click.echo(f"  Session database: {Config.SESSION_DB_PATH}")
-    click.echo(f"  Log directory: {Config.LOG_DIR}")
-    click.echo(f"  Batch size: {Config.BATCH_SIZE} emails")
-    click.echo(f"  Confidence threshold: {Config.CONFIDENCE_THRESHOLD}")
+    click.echo(f"  Data directory: {storage_config.home_dir}")
+    click.echo(f"  Session database: {storage_config.session_db_path}")
+    click.echo(f"  Log directory: {storage_config.log_dir}")
+    click.echo(f"  Batch size: {claude_config.batch_size} emails")
+    click.echo(f"  Confidence threshold: {claude_config.confidence_threshold}")
 
 
 if __name__ == "__main__":
