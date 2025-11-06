@@ -5,10 +5,12 @@ from typing import List, Optional
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import BatchHttpRequest
 
-from gmail_classifier.lib.config import Config
+from gmail_classifier.lib.cache import cached
+from gmail_classifier.lib.config import gmail_config, cache_config
 from gmail_classifier.lib.logger import get_logger
-from gmail_classifier.lib.utils import Timer, retry_with_exponential_backoff
+from gmail_classifier.lib.utils import Timer, batch_items, rate_limit, retry_with_exponential_backoff
 from gmail_classifier.models.email import Email
 from gmail_classifier.models.label import Label
 
@@ -29,6 +31,7 @@ class GmailClient:
         self.service = build("gmail", "v1", credentials=credentials)
         logger.info("Gmail API client initialized")
 
+    @rate_limit(calls_per_second=gmail_config.api_rate_limit)
     @retry_with_exponential_backoff()
     def get_labels(self) -> List[Label]:
         """
@@ -60,6 +63,8 @@ class GmailClient:
             logger.error(f"Failed to fetch Gmail labels: {error}")
             raise
 
+    @cached(ttl_seconds=cache_config.label_ttl_seconds)
+    @rate_limit(calls_per_second=gmail_config.api_rate_limit)
     @retry_with_exponential_backoff()
     def get_user_labels(self) -> List[Label]:
         """
@@ -74,67 +79,94 @@ class GmailClient:
         logger.info(f"Found {len(user_labels)} user-created labels")
         return user_labels
 
+    @rate_limit(calls_per_second=gmail_config.api_rate_limit)
     @retry_with_exponential_backoff()
     def list_unlabeled_messages(
         self,
-        max_results: Optional[int] = None,
-    ) -> List[str]:
+        max_results: int = 100,
+        page_token: Optional[str] = None,
+    ) -> tuple[List[str], Optional[str]]:
         """
-        List message IDs for unlabeled emails.
+        List unlabeled message IDs with pagination.
 
         Unlabeled emails are those with only system labels (INBOX, UNREAD, etc.)
         and no user-created labels.
 
         Args:
-            max_results: Maximum number of message IDs to return
+            max_results: Maximum number of message IDs to return (default 100)
+            page_token: Token for next page (from previous call)
 
         Returns:
-            List of Gmail message IDs
+            Tuple of (message_ids, next_page_token)
         """
         try:
             with Timer("list_unlabeled_messages"):
                 # Query for messages without user labels
-                # Note: This retrieves all messages; we filter unlabeled ones
-                # A more efficient approach would use label queries, but Gmail API
-                # doesn't directly support "no user labels" query
-                query = "in:inbox"  # Start with inbox
+                # Note: We use "in:inbox" as the query, then filter unlabeled ones
+                # when fetching full messages
+                query = "in:inbox"
 
-                message_ids = []
-                page_token = None
-
-                while True:
-                    results = (
-                        self.service.users()
-                        .messages()
-                        .list(
-                            userId="me",
-                            q=query,
-                            maxResults=min(500, max_results) if max_results else 500,
-                            pageToken=page_token,
-                        )
-                        .execute()
+                results = (
+                    self.service.users()
+                    .messages()
+                    .list(
+                        userId="me",
+                        q=query,
+                        maxResults=max_results,
+                        pageToken=page_token,
                     )
+                    .execute()
+                )
 
-                    messages = results.get("messages", [])
-                    message_ids.extend([msg["id"] for msg in messages])
+                messages = results.get("messages", [])
+                message_ids = [msg["id"] for msg in messages]
+                next_page_token = results.get("nextPageToken")
 
-                    # Check if we've reached max_results
-                    if max_results and len(message_ids) >= max_results:
-                        message_ids = message_ids[:max_results]
-                        break
+                logger.debug(
+                    f"Listed {len(message_ids)} message IDs, "
+                    f"has_more: {next_page_token is not None}"
+                )
 
-                    # Check for next page
-                    page_token = results.get("nextPageToken")
-                    if not page_token:
-                        break
-
-                logger.info(f"Found {len(message_ids)} potential unlabeled messages")
-                return message_ids
+                return message_ids, next_page_token
 
         except HttpError as error:
             logger.error(f"Failed to list unlabeled messages: {error}")
             raise
 
+    @rate_limit(calls_per_second=gmail_config.api_rate_limit)
+    @retry_with_exponential_backoff()
+    def count_unlabeled_emails(self) -> int:
+        """
+        Get count of unlabeled emails for progress tracking.
+
+        Note: Gmail API doesn't provide direct count, so we use resultSizeEstimate
+        which provides an approximate count.
+
+        Returns:
+            Estimated count of unlabeled emails
+        """
+        try:
+            with Timer("count_unlabeled_emails"):
+                results = (
+                    self.service.users()
+                    .messages()
+                    .list(
+                        userId="me",
+                        maxResults=1,
+                        q="in:inbox",
+                    )
+                    .execute()
+                )
+
+                count = results.get("resultSizeEstimate", 0)
+                logger.debug(f"Estimated {count} unlabeled emails")
+                return count
+
+        except HttpError as error:
+            logger.error(f"Failed to count unlabeled emails: {error}")
+            raise
+
+    @rate_limit(calls_per_second=gmail_config.api_rate_limit)
     @retry_with_exponential_backoff()
     def get_message(self, message_id: str) -> Email:
         """
@@ -166,29 +198,65 @@ class GmailClient:
             logger.error(f"Failed to fetch message {message_id}: {error}")
             raise
 
+    @rate_limit(calls_per_second=5.0)  # Lower rate for batch operations
+    @retry_with_exponential_backoff()
     def get_messages_batch(self, message_ids: List[str]) -> List[Email]:
         """
-        Fetch multiple Gmail messages in batch.
+        Fetch multiple messages using Gmail Batch API.
 
         Args:
-            message_ids: List of Gmail message IDs
+            message_ids: List of Gmail message IDs to fetch
 
         Returns:
             List of Email objects
+
+        Note:
+            Gmail Batch API supports up to 100 requests per batch.
+            This method automatically chunks larger requests.
         """
-        emails = []
+        with Timer("get_messages_batch"):
+            emails = []
+            failed_ids = []
 
-        for message_id in message_ids:
-            try:
-                email = self.get_message(message_id)
-                emails.append(email)
-            except Exception as e:
-                logger.error(f"Failed to fetch message {message_id}: {e}")
-                # Continue with other messages
+            # Process in chunks of 100 (Gmail batch API limit)
+            for chunk in batch_items(message_ids, 100):
+                batch = self.service.new_batch_http_request()
 
-        logger.info(f"Retrieved {len(emails)}/{len(message_ids)} messages successfully")
-        return emails
+                # Closure to capture results
+                def callback(request_id, response, exception):
+                    if exception:
+                        logger.error(f"Batch request failed for message {request_id}: {exception}")
+                        failed_ids.append(request_id)
+                    else:
+                        try:
+                            email = Email.from_gmail_message(response)
+                            emails.append(email)
+                        except Exception as e:
+                            logger.error(f"Failed to parse email {request_id}: {e}")
+                            failed_ids.append(request_id)
 
+                # Add all messages in chunk to batch
+                for msg_id in chunk:
+                    batch.add(
+                        self.service.users().messages().get(
+                            userId="me",
+                            id=msg_id,
+                            format="full"
+                        ),
+                        callback=callback,
+                        request_id=msg_id
+                    )
+
+                # Execute batch request
+                batch.execute()
+
+            if failed_ids:
+                logger.warning(f"Failed to fetch {len(failed_ids)} messages: {failed_ids}")
+
+            logger.info(f"Fetched {len(emails)} messages using batch API")
+            return emails
+
+    @rate_limit(calls_per_second=gmail_config.api_rate_limit)
     @retry_with_exponential_backoff()
     def modify_message_labels(
         self,
@@ -249,6 +317,7 @@ class GmailClient:
         """
         return self.modify_message_labels(message_id, add_labels=[label_id])
 
+    @rate_limit(calls_per_second=gmail_config.api_rate_limit)
     def get_profile(self) -> dict:
         """
         Get the user's Gmail profile.
@@ -273,21 +342,55 @@ class GmailClient:
         """
         Get emails that have no user-created labels.
 
+        NOTE: This method loads all emails into memory and should be avoided
+        for large email volumes. Use list_unlabeled_messages with pagination instead.
+
         Args:
             max_results: Maximum number of emails to retrieve
 
         Returns:
             List of unlabeled Email objects
         """
-        # Get all message IDs
-        message_ids = self.list_unlabeled_messages(max_results=max_results)
+        # Get all message IDs using pagination
+        all_message_ids = []
+        page_token = None
 
-        if not message_ids:
+        while True:
+            # Calculate remaining slots
+            remaining = None
+            if max_results:
+                remaining = max_results - len(all_message_ids)
+                if remaining <= 0:
+                    break
+
+            # Fetch page of message IDs
+            page_size = min(500, remaining) if remaining else 500
+            message_ids, next_page_token = self.list_unlabeled_messages(
+                max_results=page_size,
+                page_token=page_token
+            )
+
+            if not message_ids:
+                break
+
+            all_message_ids.extend(message_ids)
+
+            # Check for next page
+            page_token = next_page_token
+            if not page_token:
+                break
+
+            # Check if we've reached max_results
+            if max_results and len(all_message_ids) >= max_results:
+                all_message_ids = all_message_ids[:max_results]
+                break
+
+        if not all_message_ids:
             logger.info("No unlabeled messages found")
             return []
 
         # Fetch full message details
-        emails = self.get_messages_batch(message_ids)
+        emails = self.get_messages_batch(all_message_ids)
 
         # Filter to only truly unlabeled emails (no user labels)
         unlabeled_emails = [email for email in emails if email.is_unlabeled]

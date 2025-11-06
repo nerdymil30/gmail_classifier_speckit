@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from gmail_classifier.lib.config import Config
+from gmail_classifier.lib.config import app_config, storage_config
 
 
 class PIISanitizer:
@@ -83,7 +83,7 @@ def setup_logger(
     logger = logging.getLogger(name)
 
     # Set log level
-    log_level = level or Config.LOG_LEVEL
+    log_level = level or app_config.log_level
     logger.setLevel(getattr(logging, log_level.upper()))
 
     # Avoid adding handlers multiple times
@@ -92,8 +92,8 @@ def setup_logger(
 
     # Create formatter with PII sanitization
     formatter = SanitizingFormatter(
-        fmt=Config.LOG_FORMAT,
-        datefmt=Config.LOG_DATE_FORMAT,
+        fmt=app_config.log_format,
+        datefmt=app_config.log_date_format,
     )
 
     # Console handler
@@ -104,11 +104,19 @@ def setup_logger(
 
     # File handler (if log_file specified)
     if log_file:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
+        from gmail_classifier.lib.utils import ensure_secure_directory, ensure_secure_file
+
+        # Ensure log directory has secure permissions
+        ensure_secure_directory(log_file.parent, mode=0o700)
+
+        # Create file handler
         file_handler = logging.FileHandler(log_file)
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
+
+        # Ensure log file has secure permissions after creation
+        ensure_secure_file(log_file, mode=0o600)
 
     return logger
 
@@ -126,7 +134,7 @@ def get_logger(name: str, log_file: Optional[str] = None) -> logging.Logger:
     """
     log_path = None
     if log_file:
-        log_path = Config.LOG_DIR / log_file
+        log_path = storage_config.log_dir / log_file
 
     return setup_logger(name, log_file=log_path)
 
