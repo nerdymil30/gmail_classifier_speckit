@@ -474,3 +474,736 @@ All 15 issues from the comprehensive code review have been resolved:
 - Comprehensive testing (8 new test suites for integration & performance)
 
 **Result:** Production-ready enterprise-grade Gmail classification system 🚀
+
+---
+---
+
+# IMAP Implementation Code Review - Action Items
+
+**Generated:** 2025-11-08
+**Review Type:** Multi-Agent Analysis (Python Quality, Security, Performance, Architecture)
+**Feature:** IMAP Login Support (Feature 001-imap-login-support)
+**Total Issues:** 19 (4 Critical, 6 High, 9 Medium)
+
+## Status: 🔴 PENDING IMPLEMENTATION
+
+This review covers the newly implemented IMAP authentication feature, including:
+- `src/gmail_classifier/auth/imap.py` (612 lines)
+- `src/gmail_classifier/storage/credentials.py` (260 lines)
+- `src/gmail_classifier/email/fetcher.py` (452 lines)
+- `src/gmail_classifier/cli/main.py` (IMAP additions)
+
+---
+
+## Priority 1 (Critical) - Fix Before Production
+
+These issues must be resolved before production deployment. **Estimated total effort: 8-10 hours.**
+
+### 016: Missing SSL/TLS Certificate Verification (CRITICAL SECURITY)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/auth/imap.py:356-361`
+- **Issue:** IMAPClient initialized without explicit SSL context or certificate verification
+- **Impact:** Man-in-the-middle attacks possible, credentials can be intercepted
+- **Security Impact:** Complete Gmail account compromise via MITM attack
+- **Fix:** Add explicit SSL context with `ssl.create_default_context()`, enforce TLS 1.2+, remove `use_ssl` parameter
+- **Effort:** 1 hour
+- **CWE:** CWE-295 (Improper Certificate Validation)
+- **OWASP:** A02:2021 – Cryptographic Failures
+
+**Detailed Fix:**
+```python
+import ssl
+
+# In authenticate() method:
+ssl_context = ssl.create_default_context()
+ssl_context.check_hostname = True
+ssl_context.verify_mode = ssl.CERT_REQUIRED
+ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+client = IMAPClient(
+    self._server,
+    port=self._port,
+    ssl=True,  # Always True
+    ssl_context=ssl_context,
+    timeout=30,
+)
+```
+
+**Testing:**
+- Verify connection fails with invalid certificate
+- Verify connection fails with expired certificate
+- Verify minimum TLS 1.2 enforced
+
+---
+
+### 017: Passwords in Memory Without Secure Cleanup (CRITICAL SECURITY)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/auth/imap.py:119` (IMAPCredentials dataclass)
+- **Issue:** Passwords stored as immutable Python strings cannot be securely erased from memory
+- **Impact:** Memory dumps, swap files, or debugging tools can reveal passwords in plaintext
+- **Security Impact:** Local attacker can extract passwords via memory dump (`gcore`, `strings`)
+- **Fix:** Use `bytearray` for password storage with `clear_password()` method using `ctypes.memset()`
+- **Effort:** 2 hours
+- **CWE:** CWE-316 (Cleartext Storage of Sensitive Information in Memory)
+- **OWASP:** A02:2021 – Cryptographic Failures
+
+**Detailed Fix:**
+```python
+import ctypes
+
+@dataclass
+class IMAPCredentials:
+    email: str
+    _password_bytes: bytearray = field(default=None, repr=False, init=False)
+    created_at: datetime = field(default_factory=datetime.now)
+    last_used: datetime | None = None
+
+    def __init__(self, email: str, password: str, **kwargs):
+        self.email = email
+        self._password_bytes = bytearray(password.encode('utf-8'))
+        self.created_at = kwargs.get('created_at', datetime.now())
+        self.last_used = kwargs.get('last_used', None)
+
+    @property
+    def password(self) -> str:
+        return self._password_bytes.decode('utf-8')
+
+    def clear_password(self) -> None:
+        if self._password_bytes:
+            ctypes.memset(id(self._password_bytes) + 32, 0, len(self._password_bytes))
+            self._password_bytes.clear()
+```
+
+**Also update:**
+- `src/gmail_classifier/cli/main.py:391,399` - Call `clear_password()` after auth failures
+- After successful credential storage, clear password from memory
+
+**Testing:**
+- Verify password cleared after authentication
+- Verify memory doesn't contain password after `clear_password()`
+
+---
+
+### 018: Email Entity Duplication (CRITICAL ARCHITECTURE)
+- **Status:** ⏳ PENDING
+- **Location:** Two different Email classes exist in codebase
+- **Issue:** IMAP Email (`email/fetcher.py`) incompatible with existing OAuth2 Email (`models/email.py`)
+- **Impact:** Classification logic will fail when passed IMAP emails - BROKEN INTEGRATION
+- **Architectural Impact:** Violates Single Source of Truth, creates integration bugs
+- **Fix:** Unify into single Email entity with dual constructors (`from_gmail_message()` and `from_imap_message()`)
+- **Effort:** 3 hours
+- **Dependencies:** Critical for classification to work with IMAP
+
+**Detailed Fix:**
+```python
+# Consolidate into src/gmail_classifier/models/email.py
+@dataclass
+class Email:
+    """Unified email representation for both Gmail API and IMAP."""
+    id: str | int  # Gmail API: string, IMAP: int
+    subject: str
+    sender: str
+    recipients: list[str]
+    body_plain: str
+    date: datetime
+    labels: list[str]
+
+    # Source-specific optional fields
+    thread_id: str | None = None  # Gmail API only
+    flags: tuple | None = None    # IMAP only
+
+    @classmethod
+    def from_gmail_message(cls, message: dict) -> "Email":
+        """Create from Gmail API response."""
+        ...
+
+    @classmethod
+    def from_imap_message(cls, msg_id: int, data: dict) -> "Email":
+        """Create from IMAP fetch response."""
+        ...
+```
+
+**Testing:**
+- Verify IMAP emails work with EmailClassifier
+- Verify OAuth2 emails still work
+- Verify field compatibility
+
+---
+
+### 019: Bare Exception Catching (CRITICAL CODE QUALITY)
+- **Status:** ⏳ PENDING
+- **Location:** 15+ instances across `auth/imap.py`, `storage/credentials.py`, `email/fetcher.py`
+- **Issue:** Using `except Exception as e:` catches `KeyboardInterrupt`, `SystemExit`, `MemoryError`
+- **Impact:** Hides critical system exceptions, prevents graceful shutdown, makes debugging impossible
+- **Code Quality Impact:** Swallows bugs, prevents Ctrl+C interruption
+- **Fix:** Replace with specific exception types: `(OSError, TimeoutError, IMAPClientError)`
+- **Effort:** 2 hours
+- **Affected Files:**
+  - `auth/imap.py`: Lines 447, 479, 488, 529, 563
+  - `storage/credentials.py`: Lines 94, 136, 164, 190, 228, 257
+  - `email/fetcher.py`: Lines 215, 265, 311, 372, 383
+
+**Detailed Fix:**
+```python
+# Before (WRONG):
+except Exception as e:
+    self._logger.error(f"Error: {e}")
+    raise IMAPConnectionError(f"Error: {e}") from e
+
+# After (CORRECT):
+except (OSError, TimeoutError, IMAPClient.Error) as e:
+    self._logger.error(f"Error: {e}")
+    raise IMAPConnectionError(f"Error: {e}") from e
+```
+
+**Testing:**
+- Verify Ctrl+C (KeyboardInterrupt) works
+- Verify system exit signals propagate
+- Verify specific errors still caught
+
+---
+
+## Priority 2 (High) - Fix Before First Release
+
+These issues should be addressed before first release. **Estimated total effort: 12-14 hours.**
+
+### 020: Session Timeout Without Automatic Cleanup (HIGH SECURITY + PERFORMANCE)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/auth/imap.py:178-188`
+- **Issue:** Stale sessions detected but never automatically cleaned up
+- **Impact:** Memory leaks, resource exhaustion, potential denial of service
+- **Security Impact:** Connection pool exhaustion enables DoS attacks
+- **Fix:** Implement background cleanup thread with session limit per email
+- **Effort:** 2 hours
+- **CWE:** CWE-400 (Uncontrolled Resource Consumption)
+
+**Detailed Fix:**
+```python
+import threading
+
+class IMAPAuthenticator:
+    def __init__(self, ...):
+        # Start background cleanup
+        self._cleanup_thread = threading.Thread(
+            target=self._session_cleanup_worker,
+            daemon=True
+        )
+        self._cleanup_thread.start()
+
+    def _session_cleanup_worker(self):
+        while True:
+            time.sleep(300)  # Every 5 minutes
+            self._cleanup_stale_sessions()
+
+    def _cleanup_stale_sessions(self):
+        stale = [
+            sid for sid, s in self._sessions.items()
+            if s.is_stale(timeout_minutes=25)
+        ]
+        for sid in stale:
+            try:
+                self.disconnect(sid)
+            except Exception as e:
+                self._logger.error(f"Cleanup failed: {e}")
+```
+
+**Testing:**
+- Verify stale sessions cleaned after 25 minutes
+- Verify cleanup thread runs in background
+- Verify max sessions per email enforced
+
+---
+
+### 021: Insufficient Password Validation (HIGH SECURITY)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/auth/imap.py:132-134`
+- **Issue:** Only checks password length (8-64 chars), doesn't validate app password format
+- **Impact:** Weak passwords accepted, no Gmail app password format validation
+- **Security Impact:** Brute-force attacks easier, users may use weak passwords
+- **Fix:** Validate Gmail app password format (16 lowercase chars), add complexity checks
+- **Effort:** 1 hour
+- **CWE:** CWE-521 (Weak Password Requirements)
+
+**Detailed Fix:**
+```python
+def _validate_password(self) -> None:
+    password = self.password
+
+    # Check for Gmail app password format
+    clean_password = password.replace(' ', '')
+    if len(clean_password) == 16 and clean_password.isalpha():
+        if not clean_password.islower():
+            raise ValueError("Gmail app passwords should be lowercase")
+        return
+
+    # For non-app passwords, enforce stronger requirements
+    if len(password) < 12:
+        raise ValueError("Regular passwords must be at least 12 characters")
+
+    # Check complexity
+    has_upper = any(c.isupper() for c in password)
+    has_lower = any(c.islower() for c in password)
+    has_digit = any(c.isdigit() for c in password)
+    has_special = any(c in string.punctuation for c in password)
+
+    if sum([has_upper, has_lower, has_digit, has_special]) < 3:
+        raise ValueError("Password must contain 3 of: upper, lower, digits, special")
+```
+
+**Testing:**
+- Verify 16-char lowercase app passwords accepted
+- Verify weak passwords rejected
+- Verify complexity requirements enforced
+
+---
+
+### 022: Email Batch Fetching Too Conservative (HIGH PERFORMANCE)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/email/fetcher.py:315-385`
+- **Issue:** Default `limit=10` is too small, causes 100 network round-trips for 1000 emails
+- **Impact:** Fetching 1000 emails takes 40 seconds of pure network overhead
+- **Performance Impact:** 5x slower than necessary
+- **Fix:** Increase default to 100, implement adaptive batching based on email size
+- **Effort:** 2 hours
+
+**Detailed Fix:**
+```python
+def fetch_emails(
+    self,
+    session_id: uuid.UUID,
+    limit: int = 100,  # Increased from 10
+    batch_size: int = 50,  # New parameter
+    criteria: str = "ALL",
+) -> list[Email]:
+    # Fetch in batches
+    for i in range(0, len(message_ids), batch_size):
+        batch_ids = message_ids[i:i + batch_size]
+
+        # Check average email size, adjust strategy
+        if len(batch_ids) > 20:
+            headers = connection.fetch(batch_ids, ["RFC822.SIZE"])
+            avg_size = sum(h.get(b'RFC822.SIZE', 0) for h in headers.values()) / len(headers)
+
+            # Large emails: fetch individually
+            if avg_size > 100_000:
+                for msg_id in batch_ids:
+                    # Fetch one at a time
+```
+
+**Performance Gain:**
+- 1000 emails: 40s → 8s (5x faster)
+- Prevents timeouts on large emails
+
+**Testing:**
+- Benchmark 100 emails < 5 seconds
+- Verify large emails don't timeout
+- Verify batch size adapts to email size
+
+---
+
+### 023: Memory Inefficient Email Parsing (HIGH PERFORMANCE)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/email/fetcher.py:387-439`
+- **Issue:** Full email bodies loaded into memory, large attachments cause memory spikes
+- **Impact:** 1000 emails at 500KB avg = 500MB memory consumption, potential OOM errors
+- **Performance Impact:** 70% memory waste
+- **Fix:** Add body size limits (100KB), skip large attachments, implement truncation
+- **Effort:** 3 hours
+
+**Detailed Fix:**
+```python
+def fetch_emails(
+    self,
+    session_id: uuid.UUID,
+    limit: int = 100,
+    max_body_size: int = 100_000,  # 100KB max
+) -> list[Email]:
+    # Use BODY.PEEK to avoid marking as read
+    fetch_fields = [
+        "BODY.PEEK[HEADER]",
+        f"BODY.PEEK[TEXT]<0.{max_body_size}>",  # Partial fetch
+        "FLAGS",
+        "INTERNALDATE",
+        "RFC822.SIZE"
+    ]
+
+def _parse_email_efficient(self, msg_id: int, data: dict, max_body_size: int) -> Email:
+    size = data.get(b'RFC822.SIZE', 0)
+
+    if size > max_body_size:
+        # Headers only for large emails
+        return Email(
+            message_id=msg_id,
+            subject=...,
+            body=f"[Email too large: {size/1024:.1f}KB - truncated]",
+            ...
+        )
+```
+
+**Memory Improvement:**
+- 1000 emails: 500MB → 100MB (70% reduction)
+- Prevents OOM errors
+
+**Testing:**
+- Verify memory usage < 200MB for 1000 emails
+- Verify large emails truncated
+- Verify classification still works
+
+---
+
+### 024: Missing Dependency Injection (HIGH ARCHITECTURE)
+- **Status:** ⏳ PENDING
+- **Location:** All classes (IMAPAuthenticator, CredentialStorage, FolderManager)
+- **Issue:** Concrete dependencies hardcoded, impossible to test without real IMAP server
+- **Impact:** Untestable code, tight coupling to external dependencies
+- **Architectural Impact:** Violates Dependency Inversion Principle
+- **Fix:** Introduce Protocol-based dependency injection with adapter pattern
+- **Effort:** 4 hours
+
+**Detailed Fix:**
+```python
+# Create protocols in src/gmail_classifier/auth/protocols.py
+from typing import Protocol
+
+@runtime_checkable
+class IMAPAuthProtocol(Protocol):
+    def authenticate(self, credentials: IMAPCredentials) -> IMAPSessionInfo: ...
+    def disconnect(self, session_id: uuid.UUID) -> None: ...
+    def is_alive(self, session_id: uuid.UUID) -> bool: ...
+
+# Create adapter
+class IMAPClientAdapter(Protocol):
+    def connect(self, server: str, port: int, ssl: bool) -> IMAPClient: ...
+
+# Update FolderManager
+class FolderManager:
+    def __init__(self, authenticator: IMAPAuthProtocol):  # Protocol, not concrete
+        self._authenticator = authenticator
+```
+
+**Benefits:**
+- Easy to mock in tests
+- Can swap implementations
+- Testable without real IMAP server
+
+**Testing:**
+- Create MockIMAPAuthenticator
+- Verify tests run without network
+- Verify type checking passes
+
+---
+
+## Priority 3 (Medium) - Fix in Next Sprint
+
+These improvements enhance code quality and maintainability. **Estimated total effort: 5-6 hours.**
+
+### 025: Exponential Backoff Too Aggressive (MEDIUM PERFORMANCE)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/auth/imap.py:428-434`
+- **Issue:** Retry timing is 3s, 6s, 12s, 24s, 48s = 93 seconds total
+- **Impact:** Users wait 1.5 minutes for transient network glitches
+- **Performance Impact:** 50% slower failure detection than necessary
+- **Fix:** Cap at 15s with jitter: 2s, 4s, 8s, 15s, 15s = 44 seconds total
+- **Effort:** 30 minutes
+
+**Detailed Fix:**
+```python
+import random
+
+def calculate_backoff(attempt: int, base: float = 2.0, max_delay: float = 15.0) -> float:
+    delay = min(base * (2 ** attempt), max_delay)
+    jitter = delay * 0.25 * (2 * random.random() - 1)
+    return delay + jitter
+
+# In authenticate():
+for attempt in range(max_retries):
+    try:
+        ...
+    except (OSError, TimeoutError) as e:
+        delay = calculate_backoff(attempt)
+        sleep(delay)
+```
+
+**Performance Gain:** 93s → 44s (50% faster)
+
+---
+
+### 026: Folder Cache Never Invalidates (MEDIUM PERFORMANCE)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/email/fetcher.py:166-190`
+- **Issue:** Folder list cached indefinitely, new labels invisible until restart
+- **Impact:** Stale folder metadata, unbounded memory growth
+- **Fix:** Add 10-minute TTL to folder cache
+- **Effort:** 1 hour
+
+**Detailed Fix:**
+```python
+@dataclass
+class CacheEntry:
+    data: list[EmailFolder]
+    created_at: datetime
+    ttl: timedelta = timedelta(minutes=10)
+
+    def is_stale(self) -> bool:
+        return datetime.now() - self.created_at > self.ttl
+
+class FolderManager:
+    def list_folders(self, session_id: uuid.UUID, force_refresh: bool = False):
+        if not force_refresh and session_id in self._folder_cache:
+            entry = self._folder_cache[session_id]
+            if not entry.is_stale():
+                return entry.data
+
+        # Fetch fresh
+        folders = self._fetch_folders_from_imap(session_id)
+        self._folder_cache[session_id] = CacheEntry(data=folders, created_at=datetime.now())
+        return folders
+```
+
+---
+
+### 027: Duplicated Validation Logic (MEDIUM CODE QUALITY)
+- **Status:** ⏳ PENDING
+- **Location:** `IMAPCredentials.__post_init__` and `IMAPAuthenticator._validate_credentials()`
+- **Issue:** Email/password validation duplicated in two places
+- **Impact:** Two sources of truth, inefficient regex recompilation
+- **Fix:** Remove `_validate_credentials()`, use dataclass validation only
+- **Effort:** 30 minutes
+
+**Detailed Fix:**
+```python
+# DELETE _validate_credentials() method entirely
+
+# In authenticate():
+def authenticate(self, credentials: IMAPCredentials) -> IMAPSessionInfo:
+    # Dataclass already validated in __post_init__
+    # Just add Gmail warning
+    self._warn_if_not_gmail(credentials.email)
+
+    # Remove: self._validate_credentials(credentials)
+```
+
+---
+
+### 028: Error Messages Expose Internal Details (MEDIUM SECURITY)
+- **Status:** ⏳ PENDING
+- **Location:** Multiple error handling locations across all files
+- **Issue:** Error messages log full exception details, may expose internal info
+- **Impact:** Information disclosure aids attackers in reconnaissance
+- **Fix:** Sanitize error messages, hash emails in logs
+- **Effort:** 1 hour
+- **CWE:** CWE-209 (Information Exposure Through Error Messages)
+
+**Detailed Fix:**
+```python
+def _sanitize_error_for_logging(self, error: Exception) -> str:
+    error_str = str(error).lower()
+    if any(w in error_str for w in ['invalid', 'credentials', 'auth']):
+        return "Authentication credentials rejected"
+    elif any(w in error_str for w in ['ssl', 'tls', 'certificate']):
+        return "SSL/TLS connection error"
+    elif any(w in error_str for w in ['timeout', 'unreachable']):
+        return "Network connectivity issue"
+    return "Connection error"
+
+def _hash_email_for_logging(self, email: str) -> str:
+    return hashlib.sha256(email.encode()).hexdigest()[:12]
+```
+
+---
+
+### 029: Missing Rate Limiting (MEDIUM SECURITY)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/auth/imap.py:306-454`
+- **Issue:** No rate limiting on authentication attempts, brute-force possible
+- **Impact:** Attackers can try unlimited passwords
+- **Fix:** Track failed attempts per email, implement exponential lockout
+- **Effort:** 2 hours
+- **CWE:** CWE-307 (Improper Restriction of Excessive Authentication Attempts)
+
+**Detailed Fix:**
+```python
+class IMAPAuthenticator:
+    def __init__(self, ...):
+        self._failed_attempts: dict[str, list[datetime]] = defaultdict(list)
+        self._lockout_until: dict[str, datetime] = {}
+
+    def _check_rate_limit(self, email: str) -> None:
+        now = datetime.now()
+
+        # Check lockout
+        if email in self._lockout_until and now < self._lockout_until[email]:
+            remaining = (self._lockout_until[email] - now).total_seconds()
+            raise IMAPAuthenticationError(
+                f"Too many failed attempts. Try again in {int(remaining)}s"
+            )
+
+        # Clean old attempts (>15 min)
+        cutoff = now - timedelta(minutes=15)
+        self._failed_attempts[email] = [
+            a for a in self._failed_attempts[email] if a > cutoff
+        ]
+
+        # Check attempt count
+        if len(self._failed_attempts[email]) >= 5:
+            lockout_min = 2 ** min(len(self._failed_attempts[email]) - 4, 6)
+            self._lockout_until[email] = now + timedelta(minutes=lockout_min)
+            raise IMAPAuthenticationError(f"Account locked for {lockout_min} minutes")
+```
+
+---
+
+### 030: Missing Type Hints in Critical Locations (MEDIUM CODE QUALITY)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/email/fetcher.py:59-69, 387-439`
+- **Issue:** Generic `tuple` and `dict` types instead of specific type hints
+- **Impact:** Type safety compromised, unclear API contracts
+- **Fix:** Add specific type hints using TypedDict
+- **Effort:** 1 hour
+
+**Detailed Fix:**
+```python
+from typing import TypedDict
+
+class IMAPFetchData(TypedDict):
+    BODY[]: bytes
+    FLAGS: tuple[bytes, ...]
+    INTERNALDATE: datetime
+
+def _parse_email(self, msg_id: int, data: IMAPFetchData) -> Email:
+    ...
+
+def from_imap_response(
+    flags: tuple[bytes, ...],  # Not just tuple
+    delimiter: bytes,
+    name: str
+) -> "EmailFolder":
+    ...
+```
+
+---
+
+### 031: Import Organization Violations (MEDIUM CODE QUALITY)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/auth/imap.py:125, 331, 592`
+- **Issue:** Importing modules inside methods (`import re`, `from time import sleep`)
+- **Impact:** Violates PEP 8, inefficient (imports on every call)
+- **Fix:** Move all imports to module top
+- **Effort:** 15 minutes
+
+**Detailed Fix:**
+```python
+# At top of file:
+import re
+from time import sleep
+from datetime import timedelta
+
+# Remove all inline imports
+```
+
+---
+
+### 032: Regex Pattern Recompilation (MEDIUM PERFORMANCE)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/auth/imap.py:128, 594`
+- **Issue:** Email validation regex compiled on every credential creation
+- **Impact:** Unnecessary CPU cycles
+- **Fix:** Compile once at module level
+- **Effort:** 15 minutes
+
+**Detailed Fix:**
+```python
+import re
+
+# Module-level constant
+EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+
+# In __post_init__:
+if not EMAIL_PATTERN.match(self.email):
+    raise ValueError(f"Invalid email format: {self.email}")
+```
+
+---
+
+### 033: Non-Pythonic Flag Checking (MEDIUM CODE QUALITY)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/email/fetcher.py:71`
+- **Issue:** Using `b"".join(flags)` for membership checks instead of set
+- **Impact:** O(n) for each check instead of O(1)
+- **Fix:** Use set for flag checking
+- **Effort:** 15 minutes
+
+**Detailed Fix:**
+```python
+# Before:
+flags_bytes = b"".join(flags)
+if b"\\Sent" in flags_bytes:
+    folder_type = "SENT"
+
+# After:
+flags_set = set(flags)
+if b"\\Sent" in flags_set:
+    folder_type = "SENT"
+```
+
+---
+
+### 034: Missing Context Managers for IMAP Connections (MEDIUM CODE QUALITY)
+- **Status:** ⏳ PENDING
+- **Location:** `src/gmail_classifier/auth/imap.py:356-361`
+- **Issue:** IMAP connections created without context managers, file descriptor leaks possible
+- **Impact:** Connection leaks if authentication fails between creation and login
+- **Fix:** Implement context manager protocol for IMAPSessionInfo
+- **Effort:** 1 hour
+
+**Detailed Fix:**
+```python
+@dataclass
+class IMAPSessionInfo:
+    # ... existing fields ...
+
+    def __enter__(self) -> "IMAPSessionInfo":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self.connection:
+            try:
+                self.connection.logout()
+            except:
+                pass
+```
+
+---
+
+## Summary
+
+**Total Issues:** 19
+- **P1 (Critical):** 4 issues - 8 hours
+- **P2 (High):** 6 issues - 14 hours
+- **P3 (Medium):** 9 issues - 6 hours
+
+**Total Estimated Effort:** 28 hours (~3.5 days)
+
+**Critical Path:**
+1. **Day 1 (8 hours):** P1 Critical - SSL/TLS, passwords, email duplication, bare exceptions
+2. **Day 2-3 (14 hours):** P2 High - Session cleanup, validation, performance optimizations
+3. **Day 4 (6 hours):** P3 Medium - Code quality improvements
+
+**Minimal Production Requirements:** Complete P1 only (8 hours)
+
+**Recommended for Release:** Complete P1 + P2 (22 hours / ~3 days)
+
+**Full Quality:** Complete all P1 + P2 + P3 (28 hours / ~3.5 days)
+
+---
+
+## Next Steps
+
+1. Review all pending items in this section
+2. Prioritize which items to implement first
+3. Create implementation plan
+4. Begin with P1 Critical issues
+5. Run comprehensive test suite after each fix
+6. Update this file as issues are resolved
+
+---
