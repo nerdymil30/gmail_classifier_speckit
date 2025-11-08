@@ -1,5 +1,5 @@
 ---
-status: pending
+status: resolved
 priority: p2
 issue_id: "024"
 tags: [architecture, testing, dependency-injection, imap]

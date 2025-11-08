@@ -1,5 +1,5 @@
 ---
-status: pending
+status: resolved
 priority: p1
 issue_id: "017"
 tags: [security, sensitive-data, memory-security, imap, critical]

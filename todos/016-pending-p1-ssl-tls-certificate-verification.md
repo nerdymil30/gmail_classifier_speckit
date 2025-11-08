@@ -1,5 +1,5 @@
 ---
-status: pending
+status: resolved
 priority: p1
 issue_id: "016"
 tags: [security, cryptographic-failures, imap, critical]

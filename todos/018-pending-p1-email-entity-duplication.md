@@ -1,5 +1,5 @@
 ---
-status: pending
+status: resolved
 priority: p1
 issue_id: "018"
 tags: [architecture, data-model, integration, imap, critical]

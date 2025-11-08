@@ -1,5 +1,5 @@
 ---
-status: pending
+status: resolved
 priority: p3
 issue_id: "031"
 tags: [code-quality, pep8, imports, imap]
