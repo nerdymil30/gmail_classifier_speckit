@@ -10,10 +10,17 @@ from gmail_classifier.auth import (
     setup_claude_api_key,
     validate_claude_api_key,
 )
-from gmail_classifier.lib.config import storage_config, claude_config
+from gmail_classifier.auth.imap import (
+    IMAPAuthenticationError,
+    IMAPAuthenticator,
+    IMAPConnectionError,
+    IMAPCredentials,
+)
+from gmail_classifier.lib.config import claude_config, storage_config
 from gmail_classifier.lib.logger import get_logger
 from gmail_classifier.lib.session_db import SessionDatabase
 from gmail_classifier.services.classifier import EmailClassifier
+from gmail_classifier.storage.credentials import CredentialStorage
 
 logger = get_logger(__name__)
 
@@ -45,7 +52,7 @@ def auth(force):
 
         if creds and creds.valid:
             click.echo("✓ Authentication successful!")
-            click.echo(f"  Credentials saved securely in system keyring")
+            click.echo("  Credentials saved securely in system keyring")
         else:
             click.echo("✗ Authentication failed", err=True)
             sys.exit(1)
@@ -161,11 +168,11 @@ def classify(limit, dry_run, verbose):
             click.echo(f"\nErrors encountered: {len(session.error_log)}")
 
         click.echo()
-        click.echo(f"✓ Classification completed successfully!")
+        click.echo("✓ Classification completed successfully!")
 
         if dry_run:
             click.echo()
-            click.echo(f"To view suggestions, run:")
+            click.echo("To view suggestions, run:")
             click.echo(f"  gmail-classifier review {session.id}")
 
     except ValueError as e:
@@ -203,7 +210,7 @@ def review(session_id):
             return
 
         # Display session summary
-        click.echo(f"\nSession Summary:")
+        click.echo("\nSession Summary:")
         click.echo(f"  User: {session.user_email}")
         click.echo(f"  Status: {session.status}")
         click.echo(f"  Total emails: {session.total_emails_to_process}")
@@ -215,14 +222,14 @@ def review(session_id):
         low_conf = [s for s in suggestions if s.confidence_category == "low"]
         no_match = [s for s in suggestions if s.confidence_category == "no_match"]
 
-        click.echo(f"\nConfidence Breakdown:")
+        click.echo("\nConfidence Breakdown:")
         click.echo(f"  High: {len(high_conf)}")
         click.echo(f"  Medium: {len(medium_conf)}")
         click.echo(f"  Low: {len(low_conf)}")
         click.echo(f"  No Match: {len(no_match)}")
 
         # Show sample suggestions
-        click.echo(f"\nSample High Confidence Suggestions:")
+        click.echo("\nSample High Confidence Suggestions:")
         click.echo("-" * 40)
 
         for i, suggestion in enumerate(high_conf[:5], 1):
@@ -338,6 +345,278 @@ def status():
     click.echo(f"  Log directory: {storage_config.log_dir}")
     click.echo(f"  Batch size: {claude_config.batch_size} emails")
     click.echo(f"  Confidence threshold: {claude_config.confidence_threshold}")
+
+    # Check IMAP credentials
+    click.echo()
+    click.echo("IMAP Authentication:")
+
+    # Check for common Gmail accounts (user would need to specify their email)
+    click.echo("  Use 'gmail-classifier login --imap' to authenticate with IMAP")
+    click.echo("  Use 'gmail-classifier auth-status' to check detailed status")
+
+
+@cli.command()
+@click.option("--imap", is_flag=True, help="Use IMAP authentication (email + app password)")
+@click.option("--email", help="Gmail email address (for IMAP)")
+def login(imap, email):
+    """Authenticate with Gmail (OAuth2 or IMAP).
+
+    Examples:
+        gmail-classifier login --imap --email user@gmail.com
+        gmail-classifier login  # OAuth2 (default)
+    """
+    if imap:
+        click.echo("Gmail IMAP Authentication")
+        click.echo("=========================")
+        click.echo()
+
+        # Prompt for email if not provided
+        if not email:
+            email = click.prompt("Gmail email address")
+
+        # Validate email format
+        if "@" not in email:
+            click.echo("✗ Invalid email format", err=True)
+            sys.exit(1)
+
+        click.echo()
+        click.echo("IMAP Authentication requires an App Password:")
+        click.echo("1. Go to: https://myaccount.google.com/apppasswords")
+        click.echo("2. Sign in to your Google Account")
+        click.echo("3. Generate a new app password for 'Mail'")
+        click.echo("4. Copy the 16-character password")
+        click.echo()
+
+        # Prompt for app password
+        password = click.prompt("Enter your App Password", hide_input=True)
+
+        if not password or len(password) < 8:
+            click.echo("✗ Invalid password format", err=True)
+            sys.exit(1)
+
+        try:
+            # Create credentials
+            credentials = IMAPCredentials(email=email, password=password)
+
+            # Test authentication
+            click.echo()
+            click.echo("Testing IMAP connection...")
+
+            authenticator = IMAPAuthenticator()
+            session = authenticator.authenticate(credentials)
+
+            click.echo("✓ IMAP connection successful!")
+
+            # Store credentials securely
+            storage = CredentialStorage()
+            if storage.store_credentials(credentials):
+                click.echo("✓ Credentials saved securely in system keyring")
+
+            # Disconnect test session
+            authenticator.disconnect(session.session_id)
+
+            click.echo()
+            click.echo("You can now use gmail-classifier with IMAP!")
+            click.echo(f"  Authenticated as: {email}")
+
+        except IMAPAuthenticationError as e:
+            click.echo(f"✗ Authentication failed: {e}", err=True)
+            click.echo()
+            click.echo("Common issues:")
+            click.echo("  • IMAP not enabled in Gmail settings")
+            click.echo("  • Invalid app password")
+            click.echo("  • 2FA not enabled (required for app passwords)")
+            sys.exit(1)
+
+        except IMAPConnectionError as e:
+            click.echo(f"✗ Connection failed: {e}", err=True)
+            click.echo()
+            click.echo("Check your network connection and try again.")
+            sys.exit(1)
+
+        except Exception as e:
+            click.echo(f"✗ Error: {e}", err=True)
+            sys.exit(1)
+
+    else:
+        # Default to OAuth2 authentication (existing behavior)
+        click.echo("Gmail OAuth2 Authentication")
+        click.echo("===========================")
+        click.echo()
+
+        try:
+            authenticator = GmailAuthenticator()
+            click.echo("Opening browser for authentication...")
+            click.echo("Please authorize the application in your browser.")
+
+            creds = authenticator.authenticate(force_reauth=False)
+
+            if creds and creds.valid:
+                click.echo("✓ Authentication successful!")
+                click.echo("  Credentials saved securely in system keyring")
+            else:
+                click.echo("✗ Authentication failed", err=True)
+                sys.exit(1)
+
+        except Exception as e:
+            click.echo(f"✗ Authentication error: {e}", err=True)
+            sys.exit(1)
+
+
+@cli.command()
+@click.option("--email", help="Check status for specific email (IMAP)")
+def auth_status(email):
+    """Check authentication status for Gmail and IMAP.
+
+    Examples:
+        gmail-classifier auth-status
+        gmail-classifier auth-status --email user@gmail.com
+    """
+    click.echo("Authentication Status")
+    click.echo("====================")
+    click.echo()
+
+    # Check Gmail OAuth2
+    click.echo("Gmail OAuth2:")
+    try:
+        authenticator = GmailAuthenticator()
+        creds = authenticator.get_credentials()
+
+        if creds and creds.valid:
+            click.echo("  ✓ Authenticated")
+            # Could show expiry, email, etc. if available
+        else:
+            click.echo("  ✗ Not authenticated")
+            click.echo("    Run: gmail-classifier auth")
+
+    except Exception as e:
+        click.echo(f"  ✗ Error checking OAuth2 status: {e}")
+
+    # Check IMAP credentials
+    click.echo()
+    click.echo("Gmail IMAP:")
+
+    storage = CredentialStorage()
+
+    if email:
+        # Check specific email
+        if storage.has_credentials(email):
+            click.echo(f"  ✓ Credentials stored for: {email}")
+
+            # Test connection
+            click.echo("  Testing connection...")
+            try:
+                creds = storage.retrieve_credentials(email)
+                authenticator = IMAPAuthenticator()
+                session = authenticator.authenticate(creds)
+
+                click.echo("  ✓ Connection test successful")
+
+                # Show session info
+                click.echo(f"    Session ID: {session.session_id}")
+                click.echo(f"    Connected at: {session.connected_at.strftime('%Y-%m-%d %H:%M:%S')}")
+
+                # Disconnect test session
+                authenticator.disconnect(session.session_id)
+
+            except Exception as e:
+                click.echo(f"  ✗ Connection test failed: {e}")
+
+        else:
+            click.echo(f"  ✗ No credentials stored for: {email}")
+            click.echo(f"    Run: gmail-classifier login --imap --email {email}")
+
+    else:
+        # Show general IMAP status
+        click.echo("  Use --email to check specific account")
+        click.echo("  Example: gmail-classifier auth-status --email user@gmail.com")
+
+    # Claude API status
+    click.echo()
+    click.echo("Claude API:")
+    claude_key = get_claude_api_key()
+
+    if claude_key:
+        click.echo("  ✓ API key configured")
+    else:
+        click.echo("  ✗ API key not configured")
+        click.echo("    Run: gmail-classifier setup-claude")
+
+
+@cli.command()
+@click.option("--imap", is_flag=True, help="Clear IMAP credentials")
+@click.option("--email", help="Email address to logout (for IMAP)")
+@click.option("--all", "logout_all", is_flag=True, help="Clear all credentials")
+def logout(imap, email, logout_all):
+    """Clear authentication credentials.
+
+    Examples:
+        gmail-classifier logout --imap --email user@gmail.com
+        gmail-classifier logout --all  # Clear everything
+    """
+    click.echo("Logout")
+    click.echo("======")
+    click.echo()
+
+    if logout_all:
+        if not click.confirm("Clear ALL credentials (OAuth2 + IMAP)?"):
+            click.echo("Logout cancelled.")
+            return
+
+        # Clear OAuth2
+        try:
+            authenticator = GmailAuthenticator()
+            authenticator.revoke_credentials()
+            click.echo("✓ OAuth2 credentials cleared")
+        except Exception as e:
+            click.echo(f"  Note: {e}")
+
+        # Clear IMAP (would need to iterate all stored emails)
+        if email:
+            storage = CredentialStorage()
+            if storage.delete_credentials(email):
+                click.echo(f"✓ IMAP credentials cleared for: {email}")
+            else:
+                click.echo(f"  No IMAP credentials found for: {email}")
+
+        click.echo()
+        click.echo("All credentials cleared.")
+
+    elif imap:
+        if not email:
+            email = click.prompt("Email address to logout")
+
+        if not click.confirm(f"Clear IMAP credentials for {email}?"):
+            click.echo("Logout cancelled.")
+            return
+
+        storage = CredentialStorage()
+
+        if storage.delete_credentials(email):
+            click.echo(f"✓ IMAP credentials cleared for: {email}")
+            click.echo()
+            click.echo("You will need to login again to use IMAP:")
+            click.echo(f"  gmail-classifier login --imap --email {email}")
+        else:
+            click.echo(f"✗ No IMAP credentials found for: {email}")
+            sys.exit(1)
+
+    else:
+        # Default: Clear OAuth2 only
+        if not click.confirm("Clear Gmail OAuth2 credentials?"):
+            click.echo("Logout cancelled.")
+            return
+
+        try:
+            authenticator = GmailAuthenticator()
+            authenticator.revoke_credentials()
+            click.echo("✓ OAuth2 credentials cleared")
+            click.echo()
+            click.echo("Run 'gmail-classifier auth' to login again")
+
+        except Exception as e:
+            click.echo(f"✗ Error: {e}", err=True)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
