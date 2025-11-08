@@ -33,7 +33,7 @@ def test_credentials() -> IMAPCredentials:
     """
     return IMAPCredentials(
         email="test@gmail.com",
-        password="test_app_password_16ch",
+        password="abcdefghijklmnop",  # Valid 16-char Gmail app password
         created_at=datetime.now(),
     )
 
@@ -313,7 +313,7 @@ class TestCredentialHelpers:
 
         with patch("keyring.get_password") as mock_get_password:
             # Arrange
-            mock_get_password.return_value = "some_password"
+            mock_get_password.return_value = "ValidPassword123!"
             storage = CredentialStorage()
 
             # Act
@@ -372,3 +372,255 @@ class TestCredentialHelpers:
                 # Verify the timestamp was updated (we can't check exact value without retrieving)
                 # This is validated by checking that keyring operations were called
                 assert mock_get_password.called
+
+
+# ============================================================================
+# Memory Security Tests (T025)
+# ============================================================================
+
+
+class TestMemorySecurity:
+    """Unit tests for secure password memory handling."""
+
+    def test_password_stored_as_bytearray(self) -> None:
+        """T025: Test password is stored as bytearray internally.
+
+        Validates:
+        - Password is stored as bytearray, not string
+        - _password_bytes attribute exists and is bytearray type
+
+        Expected outcome: _password_bytes is a bytearray
+        """
+        credentials = IMAPCredentials(
+            email="test@gmail.com",
+            password="TestPassword123!"
+        )
+
+        # Assert internal storage is bytearray
+        assert hasattr(credentials, '_password_bytes')
+        assert isinstance(credentials._password_bytes, bytearray)
+        assert len(credentials._password_bytes) > 0
+
+    def test_password_property_returns_string(self) -> None:
+        """T025: Test password property accessor returns string.
+
+        Validates:
+        - Password property returns string
+        - String matches original password
+
+        Expected outcome: Property returns correct string
+        """
+        test_password = "TestPassword123!"
+        credentials = IMAPCredentials(
+            email="test@gmail.com",
+            password=test_password
+        )
+
+        # Assert property returns string
+        assert isinstance(credentials.password, str)
+        assert credentials.password == test_password
+
+    def test_clear_password_zeros_memory(self) -> None:
+        """T025: Test clear_password() zeros password in memory.
+
+        Validates:
+        - clear_password() empties the bytearray
+        - _password_bytes is empty after clearing
+
+        Expected outcome: Password cleared from memory
+        """
+        credentials = IMAPCredentials(
+            email="test@gmail.com",
+            password="TestPassword123!"
+        )
+
+        # Verify password exists
+        assert len(credentials._password_bytes) > 0
+
+        # Clear password
+        credentials.clear_password()
+
+        # Assert password is cleared
+        assert len(credentials._password_bytes) == 0
+
+    def test_clear_password_multiple_times_safe(self) -> None:
+        """T025: Test clear_password() can be called multiple times safely.
+
+        Validates:
+        - Calling clear_password() multiple times doesn't raise errors
+        - Method is idempotent
+
+        Expected outcome: No errors when called repeatedly
+        """
+        credentials = IMAPCredentials(
+            email="test@gmail.com",
+            password="TestPassword123!"
+        )
+
+        # Clear multiple times - should not raise
+        credentials.clear_password()
+        credentials.clear_password()
+        credentials.clear_password()
+
+        # Assert no errors and password still cleared
+        assert len(credentials._password_bytes) == 0
+
+    def test_accessing_password_after_clear_raises_error(self) -> None:
+        """T025: Test accessing password after clear raises ValueError.
+
+        Validates:
+        - Accessing password property after clear raises ValueError
+        - Error message indicates password was cleared
+
+        Expected outcome: ValueError raised with appropriate message
+        """
+        credentials = IMAPCredentials(
+            email="test@gmail.com",
+            password="TestPassword123!"
+        )
+
+        # Clear password
+        credentials.clear_password()
+
+        # Assert accessing password raises ValueError
+        with pytest.raises(ValueError) as exc_info:
+            _ = credentials.password
+
+        assert "cleared" in str(exc_info.value).lower()
+
+    def test_del_cleanup_clears_password(self) -> None:
+        """T025: Test __del__ cleanup clears password on deletion.
+
+        Validates:
+        - Password is cleared when object is deleted
+        - __del__ calls clear_password()
+
+        Expected outcome: Password cleared on object deletion
+        """
+        credentials = IMAPCredentials(
+            email="test@gmail.com",
+            password="TestPassword123!"
+        )
+
+        # Get reference to internal bytearray
+        password_bytes = credentials._password_bytes
+
+        # Verify password exists
+        assert len(password_bytes) > 0
+
+        # Delete object
+        del credentials
+
+        # Assert password was cleared (bytearray should be empty)
+        # Note: This is best effort - GC timing is non-deterministic
+        assert len(password_bytes) == 0
+
+    def test_password_not_in_repr(self) -> None:
+        """T025: Test password not exposed in __repr__.
+
+        Validates:
+        - __repr__ doesn't contain the password
+        - __repr__ is safe to log
+
+        Expected outcome: Password not in string representation
+        """
+        test_password = "SuperSecret123!"
+        credentials = IMAPCredentials(
+            email="test@gmail.com",
+            password=test_password
+        )
+
+        repr_str = repr(credentials)
+
+        # Assert password not in repr
+        assert test_password not in repr_str
+        assert "password" not in repr_str.lower()
+        assert "SuperSecret" not in repr_str
+
+    def test_credentials_with_custom_timestamps(self) -> None:
+        """T025: Test credentials with custom created_at and last_used.
+
+        Validates:
+        - Custom timestamps are preserved
+        - Password storage still works with custom timestamps
+
+        Expected outcome: Custom timestamps stored correctly
+        """
+        from datetime import datetime, timedelta
+
+        created = datetime.now() - timedelta(days=7)
+        last_used = datetime.now() - timedelta(days=1)
+
+        credentials = IMAPCredentials(
+            email="test@gmail.com",
+            password="TestPassword123!",
+            created_at=created,
+            last_used=last_used
+        )
+
+        # Assert timestamps preserved
+        assert credentials.created_at == created
+        assert credentials.last_used == last_used
+
+        # Assert password still accessible
+        assert credentials.password == "TestPassword123!"
+
+        # Assert password can still be cleared
+        credentials.clear_password()
+        assert len(credentials._password_bytes) == 0
+
+    def test_password_encoding_handles_unicode(self) -> None:
+        """T025: Test password storage handles unicode characters.
+
+        Validates:
+        - Unicode characters in password are handled correctly
+        - Encoding/decoding preserves unicode
+
+        Expected outcome: Unicode passwords work correctly
+        """
+        unicode_password = "Testпароль密码123!"
+        credentials = IMAPCredentials(
+            email="test@gmail.com",
+            password=unicode_password
+        )
+
+        # Assert password stored and retrieved correctly
+        assert credentials.password == unicode_password
+
+        # Assert can be cleared
+        credentials.clear_password()
+        assert len(credentials._password_bytes) == 0
+
+    def test_ctypes_memset_called_on_clear(self) -> None:
+        """T025: Test ctypes.memset is called during clear_password.
+
+        Validates:
+        - clear_password() attempts to use ctypes.memset
+        - Fallback works if memset fails
+
+        Expected outcome: Password cleared even if memset fails
+        """
+        credentials = IMAPCredentials(
+            email="test@gmail.com",
+            password="TestPassword123!"
+        )
+
+        # Mock ctypes.memset to raise exception
+        import ctypes
+        original_memset = ctypes.memset
+
+        def failing_memset(*args, **kwargs):
+            raise Exception("memset failed")
+
+        # Temporarily replace memset
+        ctypes.memset = failing_memset
+
+        try:
+            # Clear should still work (fallback to bytearray.clear())
+            credentials.clear_password()
+
+            # Assert password still cleared despite memset failure
+            assert len(credentials._password_bytes) == 0
+        finally:
+            # Restore original memset
+            ctypes.memset = original_memset

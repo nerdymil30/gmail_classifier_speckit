@@ -1,9 +1,10 @@
 ---
-status: pending
+status: completed
 priority: p3
 issue_id: "029"
 tags: [security, rate-limiting, authentication, imap]
 dependencies: []
+completed_date: 2025-11-08
 ---
 
 # Missing Rate Limiting on Authentication

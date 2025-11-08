@@ -1,5 +1,5 @@
 ---
-status: pending
+status: resolved
 priority: p3
 issue_id: "025"
 tags: [performance, retry-logic, imap]

@@ -1,35 +1,62 @@
 """Email entity model."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from gmail_classifier.email.fetcher import IMAPFetchData
 
 
 @dataclass
 class Email:
     """
-    Represents a Gmail message.
+    Unified email representation for both Gmail API and IMAP sources.
 
-    Attributes correspond to Gmail API message resource fields.
+    Core fields are required for both sources. Gmail API-specific and
+    IMAP-specific fields are optional to support both authentication methods.
+
+    Attributes:
+        id: Message identifier (Gmail API: string, IMAP: integer)
+        subject: Email subject line
+        sender: From address
+        recipients: To addresses
+        body_plain: Plain text body content
+        date: Email date/time
+        labels: Gmail labels or IMAP folder names
+        is_unread: Whether email is unread
+        thread_id: Gmail thread ID (OAuth2 only)
+        sender_name: Parsed sender name (OAuth2 only)
+        snippet: Email preview text (OAuth2 only)
+        body_html: HTML body content (OAuth2 only)
+        has_attachments: Whether email has attachments
+        flags: IMAP flags (IMAP only)
     """
 
-    id: str
-    thread_id: str
-    subject: Optional[str]
+    # Core fields (common to both sources)
+    id: str | int
+    subject: str | None
     sender: str
-    sender_name: Optional[str]
     recipients: list[str]
+    body_plain: str | None
     date: datetime
-    snippet: Optional[str]
-    body_plain: Optional[str]
-    body_html: Optional[str]
     labels: list[str]
-    has_attachments: bool
     is_unread: bool
+
+    # Gmail API specific fields (optional)
+    thread_id: str | None = None
+    sender_name: str | None = None
+    snippet: str | None = None
+    body_html: str | None = None
+    has_attachments: bool = False
+
+    # IMAP specific fields (optional)
+    flags: tuple | None = None
 
     def __post_init__(self) -> None:
         """Validate email data after initialization."""
-        if not self.id:
+        # Validate ID (handle both string and int)
+        if self.id is None or (isinstance(self.id, str) and not self.id):
             raise ValueError("Email ID cannot be empty")
         if not self.sender:
             raise ValueError("Email sender cannot be empty")
@@ -70,19 +97,28 @@ class Email:
 
     def to_dict(self) -> dict:
         """Convert email to dictionary (without body content for privacy)."""
-        return {
-            "id": self.id,
-            "thread_id": self.thread_id,
+        result = {
+            "id": str(self.id),  # Convert to string for consistency
             "subject": self.subject,
             "sender": self.sender,
-            "sender_name": self.sender_name,
             "recipients": self.recipients,
             "date": self.date.isoformat(),
-            "snippet": self.snippet,
             "labels": self.labels,
-            "has_attachments": self.has_attachments,
             "is_unread": self.is_unread,
+            "has_attachments": self.has_attachments,
         }
+
+        # Add optional fields only if present
+        if self.thread_id is not None:
+            result["thread_id"] = self.thread_id
+        if self.sender_name is not None:
+            result["sender_name"] = self.sender_name
+        if self.snippet is not None:
+            result["snippet"] = self.snippet
+        if self.flags is not None:
+            result["flags"] = self.flags
+
+        return result
 
     @classmethod
     def from_gmail_message(cls, message: dict) -> "Email":
@@ -133,8 +169,116 @@ class Email:
             is_unread="UNREAD" in message.get("labelIds", []),
         )
 
+    @classmethod
+    def from_imap_message(cls, msg_id: int, data: "IMAPFetchData") -> "Email":
+        """
+        Create Email instance from IMAP fetch response.
+
+        Args:
+            msg_id: IMAP message ID
+            data: Raw email data from IMAP fetch (includes BODY[], FLAGS, INTERNALDATE)
+                  Runtime keys are bytes (e.g., b"BODY[]")
+
+        Returns:
+            Email instance
+
+        Note:
+            - Uses email.parser to parse RFC 822 message format
+            - Prefers plain text body over HTML
+            - Extracts is_unread from IMAP \\Seen flag
+            - IMAP-specific fields (flags) are preserved
+        """
+        from email.parser import BytesParser
+        from email.policy import default
+
+        # Note: Runtime uses bytes keys, but TypedDict requires string keys.
+        # We use cast(Any, data) to access bytes keys while maintaining type hints.
+        data_any = cast(Any, data)
+
+        # Parse email message
+        raw_email = data_any[b"BODY[]"]
+        parser = BytesParser(policy=default)
+        msg = parser.parsebytes(raw_email)
+
+        # Extract headers
+        subject = msg.get("Subject", "")
+        sender = msg.get("From", "")
+        to = msg.get("To", "")
+        recipients = [addr.strip() for addr in to.split(",") if addr.strip()]
+
+        # Extract sender name using existing parser
+        sender_name, sender_email = cls._parse_email_address(sender)
+
+        # Extract body (prefer plain text)
+        body = ""
+        body_html = None
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                if content_type == "text/plain" and not body:
+                    try:
+                        body = part.get_content()
+                    except Exception:
+                        pass
+                elif content_type == "text/html" and not body_html:
+                    try:
+                        body_html = part.get_content()
+                    except Exception:
+                        pass
+            # Fallback to HTML if no plain text
+            if not body and body_html:
+                body = body_html
+        else:
+            try:
+                content = msg.get_content()
+                if msg.get_content_type() == "text/html":
+                    body_html = content
+                body = content
+            except Exception:
+                body = ""
+
+        # Parse date from INTERNALDATE or Date header
+        try:
+            from email.utils import parsedate_to_datetime
+            date_str = msg.get("Date", "")
+            if date_str:
+                email_date = parsedate_to_datetime(date_str)
+            else:
+                email_date = datetime.now()
+        except Exception:
+            email_date = datetime.now()
+
+        # Get flags and determine if unread
+        flags = data_any.get(b"FLAGS", ())
+        is_unread = b'\\Seen' not in flags
+
+        # Check for attachments
+        has_attachments = False
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_filename():
+                    has_attachments = True
+                    break
+
+        return cls(
+            id=msg_id,
+            subject=subject,
+            sender=sender_email or sender,
+            sender_name=sender_name,
+            recipients=recipients,
+            body_plain=body,
+            body_html=body_html,
+            date=email_date,
+            labels=[],  # IMAP labels can be added via X-GM-LABELS if needed
+            is_unread=is_unread,
+            thread_id=None,  # Not available in IMAP
+            snippet=body[:100] if body else "",  # First 100 chars as snippet
+            has_attachments=has_attachments,
+            flags=flags,
+        )
+
     @staticmethod
-    def _parse_email_address(address_str: str) -> tuple[Optional[str], Optional[str]]:
+    def _parse_email_address(address_str: str) -> tuple[str | None, str | None]:
         """
         Parse email address from header format.
 
@@ -149,7 +293,7 @@ class Email:
         return name or None, email or None
 
     @staticmethod
-    def _parse_email_addresses(addresses_str: str) -> list[tuple[Optional[str], Optional[str]]]:
+    def _parse_email_addresses(addresses_str: str) -> list[tuple[str | None, str | None]]:
         """
         Parse multiple email addresses from header.
 
@@ -163,7 +307,7 @@ class Email:
         return [(name or None, email or None) for name, email in getaddresses([addresses_str])]
 
     @staticmethod
-    def _extract_body(payload: dict) -> tuple[Optional[str], Optional[str]]:
+    def _extract_body(payload: dict) -> tuple[str | None, str | None]:
         """
         Extract plain text and HTML body from message payload.
 

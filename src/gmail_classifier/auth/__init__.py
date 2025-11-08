@@ -10,6 +10,10 @@ from gmail_classifier.auth.claude_auth import (
     validate_claude_api_key,
     delete_claude_api_key,
 )
+from gmail_classifier.auth.protocols import (
+    IMAPAuthProtocol,
+    IMAPClientProtocol,
+)
 
 __all__ = [
     # Gmail authentication
@@ -20,4 +24,7 @@ __all__ = [
     "get_claude_api_key",
     "validate_claude_api_key",
     "delete_claude_api_key",
+    # IMAP protocols
+    "IMAPAuthProtocol",
+    "IMAPClientProtocol",
 ]
