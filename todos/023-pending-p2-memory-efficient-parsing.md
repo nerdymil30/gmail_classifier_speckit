@@ -1,5 +1,5 @@
 ---
-status: pending
+status: resolved
 priority: p2
 issue_id: "023"
 tags: [performance, memory, imap, optimization]

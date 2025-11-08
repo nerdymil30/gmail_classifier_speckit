@@ -1,5 +1,5 @@
 ---
-status: pending
+status: resolved
 priority: p3
 issue_id: "033"
 tags: [code-quality, pythonic, performance, imap]

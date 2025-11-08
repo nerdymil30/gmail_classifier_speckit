@@ -411,6 +411,8 @@ def login(imap, email):
             storage = CredentialStorage()
             if storage.store_credentials(credentials):
                 click.echo("✓ Credentials saved securely in system keyring")
+                credentials.clear_password()  # Clear from memory after storage
+                credentials.clear_password()  # Clear from memory after storage
 
             # Disconnect test session
             authenticator.disconnect(session.session_id)
@@ -436,6 +438,12 @@ def login(imap, email):
 
         except Exception as e:
             click.echo(f"✗ Error: {e}", err=True)
+            # Password may have been created before error, try to clear
+            try:
+                if 'credentials' in locals():
+                    credentials.clear_password()
+            except:
+                pass
             sys.exit(1)
 
     else:
@@ -518,9 +526,25 @@ def auth_status(email):
 
                 # Disconnect test session
                 authenticator.disconnect(session.session_id)
+                # Clear password from memory
+                creds.clear_password()
+                # Clear password from memory
+                creds.clear_password()
 
             except Exception as e:
                 click.echo(f"  ✗ Connection test failed: {e}")
+                # Password may have been created, try to clear
+                try:
+                    if 'creds' in locals():
+                        creds.clear_password()
+                except:
+                    pass
+                # Password may have been created, try to clear
+                try:
+                    if 'creds' in locals():
+                        creds.clear_password()
+                except:
+                    pass
 
         else:
             click.echo(f"  ✗ No credentials stored for: {email}")
@@ -616,6 +640,12 @@ def logout(imap, email, logout_all):
 
         except Exception as e:
             click.echo(f"✗ Error: {e}", err=True)
+            # Password may have been created before error, try to clear
+            try:
+                if 'credentials' in locals():
+                    credentials.clear_password()
+            except:
+                pass
             sys.exit(1)
 
 

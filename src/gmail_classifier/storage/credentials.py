@@ -17,6 +17,7 @@ import logging
 from datetime import datetime
 
 import keyring
+import keyring.errors
 
 from gmail_classifier.auth.imap import IMAPCredentials
 
@@ -91,7 +92,7 @@ class CredentialStorage:
             )
             return True
 
-        except Exception as e:
+        except (keyring.errors.KeyringError, OSError, PermissionError) as e:
             self._logger.error(
                 f"Failed to store credentials for {credentials.email}: {e}"
             )
@@ -132,7 +133,7 @@ class CredentialStorage:
             self._logger.info(f"Credentials retrieved successfully for {email}")
             return credentials
 
-        except Exception as e:
+        except (keyring.errors.KeyringError, OSError, PermissionError) as e:
             self._logger.error(
                 f"Failed to retrieve credentials for {email}: {e}"
             )
@@ -161,7 +162,7 @@ class CredentialStorage:
             self._logger.info(f"Credentials deleted successfully for {email}")
             return True
 
-        except Exception as e:
+        except (keyring.errors.KeyringError, OSError, PermissionError) as e:
             # Keyring raises exception if password doesn't exist
             self._logger.warning(
                 f"Failed to delete credentials for {email}: {e}"
@@ -187,7 +188,7 @@ class CredentialStorage:
             password = keyring.get_password(self._service_name, email)
             return password is not None
 
-        except Exception as e:
+        except (keyring.errors.KeyringError, OSError, PermissionError) as e:
             self._logger.warning(
                 f"Error checking credentials for {email}: {e}"
             )
@@ -225,7 +226,7 @@ class CredentialStorage:
             self._logger.debug(f"Last used timestamp noted for {email}")
             return True
 
-        except Exception as e:
+        except (keyring.errors.KeyringError, OSError, PermissionError) as e:
             self._logger.error(
                 f"Failed to update last_used for {email}: {e}"
             )
@@ -254,6 +255,6 @@ class CredentialStorage:
             )
             return []
 
-        except Exception as e:
+        except (keyring.errors.KeyringError, OSError, PermissionError) as e:
             self._logger.error(f"Failed to list stored emails: {e}")
             return []
