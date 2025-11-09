@@ -412,7 +412,6 @@ def login(imap, email):
             if storage.store_credentials(credentials):
                 click.echo("✓ Credentials saved securely in system keyring")
                 credentials.clear_password()  # Clear from memory after storage
-                credentials.clear_password()  # Clear from memory after storage
 
             # Disconnect test session
             authenticator.disconnect(session.session_id)
@@ -428,6 +427,7 @@ def login(imap, email):
             click.echo("  • IMAP not enabled in Gmail settings")
             click.echo("  • Invalid app password")
             click.echo("  • 2FA not enabled (required for app passwords)")
+            # Note: Password already cleared by authenticate() method on failure
             sys.exit(1)
 
         except IMAPConnectionError as e:
@@ -528,17 +528,9 @@ def auth_status(email):
                 authenticator.disconnect(session.session_id)
                 # Clear password from memory
                 creds.clear_password()
-                # Clear password from memory
-                creds.clear_password()
 
             except Exception as e:
                 click.echo(f"  ✗ Connection test failed: {e}")
-                # Password may have been created, try to clear
-                try:
-                    if 'creds' in locals():
-                        creds.clear_password()
-                except:
-                    pass
                 # Password may have been created, try to clear
                 try:
                     if 'creds' in locals():

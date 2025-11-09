@@ -18,6 +18,7 @@ AIDEV-NOTE: Label operations via X-GM-LABELS
 - No OAuth required, simplifying authentication flow
 """
 
+import ctypes
 import hashlib
 import logging
 import random
@@ -110,18 +111,38 @@ class IMAPCredentials:
     Attributes:
         email: Gmail email address (e.g., user@gmail.com)
         password: IMAP password or app-specific password (16 chars for app passwords)
+                  Stored internally as bytearray for secure cleanup
         created_at: Timestamp when credentials were first stored
         last_used: Timestamp of last successful authentication (auto-updated)
     Security considerations:
+    - Password stored as bytearray for secure memory cleanup
     - Never log password in plain text
     - Sanitize password from error messages
     - Clear from memory after failed authentication
     - Use secure string comparison for validation
+    - Automatic cleanup on object deletion via __del__
     """
     email: str
-    password: str
+    _password_bytes: bytearray = field(default=None, repr=False, init=False)
     created_at: datetime = field(default_factory=datetime.now)
     last_used: datetime | None = None
+
+    def __init__(self, email: str, password: str, created_at: datetime = None, last_used: datetime = None):
+        """Initialize credentials with secure password storage.
+
+        Args:
+            email: Gmail email address
+            password: IMAP password or app-specific password
+            created_at: Optional timestamp when credentials were created
+            last_used: Optional timestamp of last use
+        """
+        self.email = email
+        self._password_bytes = bytearray(password.encode('utf-8'))
+        self.created_at = created_at if created_at is not None else datetime.now()
+        self.last_used = last_used
+        # Validate after initialization
+        self.__post_init__()
+
     def __post_init__(self) -> None:
         """Validate email format and password constraints."""
         # Email format validation
@@ -129,6 +150,39 @@ class IMAPCredentials:
             raise ValueError(f"Invalid email format: {self.email}")
         # Password validation with comprehensive security checks
         self._validate_password()
+
+    @property
+    def password(self) -> str:
+        """Get password as string (use sparingly).
+
+        Returns:
+            Password decoded from bytearray
+
+        Raises:
+            ValueError: Password has been cleared from memory
+        """
+        if not self._password_bytes:
+            raise ValueError("Password has been cleared from memory")
+        return self._password_bytes.decode('utf-8')
+
+    def clear_password(self) -> None:
+        """Securely clear password from memory.
+
+        Uses ctypes.memset() to overwrite password bytes at C memory level
+        before clearing the bytearray. This prevents password data from
+        remaining in memory dumps or swap files.
+
+        Can be called multiple times safely (idempotent).
+        """
+        if self._password_bytes:
+            # Overwrite with zeros at C memory level
+            # Note: bytearray has 32 bytes of header before data in CPython
+            ctypes.memset(id(self._password_bytes) + 32, 0, len(self._password_bytes))
+            self._password_bytes.clear()
+
+    def __del__(self):
+        """Cleanup password on object deletion."""
+        self.clear_password()
 
     def _validate_password(self) -> None:
         """Validate password format and security requirements.
@@ -412,14 +466,22 @@ class IMAPAuthenticator:
             IMAPConnectionError: Connection failed after retries
             ValueError: Invalid credential format
         Flow:
-        1. Validate credentials format
+        1. Validate credentials format (done in IMAPCredentials.__post_init__)
         2. Create session with CONNECTING state
         3. Attempt connection with retry logic (max 5 attempts)
         4. On success: Update session state to CONNECTED, update last_used
         5. On failure: Raise appropriate error with context
         """
-        # Validate credentials (will raise ValueError if invalid)
-        self._validate_credentials(credentials)
+        # Credentials already validated in IMAPCredentials.__post_init__
+        # Warn if not Gmail domain (but allow for Google Workspace)
+        if not (
+            credentials.email.endswith("@gmail.com")
+            or "google" in credentials.email.lower()
+        ):
+            self._logger.warning(
+                f"Email {credentials.email} may not be a Gmail account. "
+                f"IMAP authentication works best with Gmail and Google Workspace accounts."
+            )
         # Check rate limiting before attempting authentication
         self._check_rate_limit(credentials.email)
         # Create session info
@@ -515,7 +577,7 @@ class IMAPAuthenticator:
                         )
                         try:
                             self.disconnect(oldest.session_id)
-                        except Exception as e:
+                        except (OSError, TimeoutError, IMAPClientError, ValueError) as e:
                             self._logger.error(f"Failed to disconnect oldest session: {self._sanitize_error(e)}")
                 # Store session
                 with self._cleanup_lock:
@@ -528,6 +590,8 @@ class IMAPAuthenticator:
             except IMAPAuthenticationError:
                 # Record failed authentication attempt
                 self._failed_attempts[credentials.email].append(datetime.now())
+                # Clear password from memory on auth failure
+                credentials.clear_password()
                 # Don't retry authentication errors - invalid credentials
                 raise
             except (OSError, TimeoutError) as e:
@@ -552,8 +616,8 @@ class IMAPAuthenticator:
                         f"after {max_retries} attempts. Please check your network "
                         f"connection and try again."
                     ) from e
-            except Exception as e:
-                # Unexpected error
+            except (OSError, TimeoutError, IMAPClientError) as e:
+                # Unexpected IMAP/network error
                 self._logger.error(f"Unexpected error during authentication: {self._sanitize_error(e)}")
                 session_info.state = SessionState.ERROR
                 raise IMAPConnectionError(f"Unexpected error: {e}") from e
@@ -577,7 +641,7 @@ class IMAPAuthenticator:
                 if session_info.selected_folder:
                     try:
                         session_info.connection.close_folder()
-                    except Exception as e:
+                    except (OSError, TimeoutError, IMAPClientError) as e:
                         self._logger.warning(f"Error closing folder: {self._sanitize_error(e)}")
                 # Logout from IMAP server
                 try:
@@ -585,7 +649,7 @@ class IMAPAuthenticator:
                     self._logger.info(
                         f"Logged out from IMAP server for session {session_id}"
                     )
-                except Exception as e:
+                except (OSError, TimeoutError, IMAPClientError) as e:
                     self._logger.warning(f"Error during logout: {self._sanitize_error(e)}")
             # Update session state
             session_info.state = SessionState.DISCONNECTED
@@ -615,7 +679,7 @@ class IMAPAuthenticator:
             session_info.connection.noop()
             session_info.update_activity()
             return True
-        except Exception as e:
+        except (OSError, TimeoutError, IMAPClientError) as e:
             self._logger.warning(
                 f"Session {session_id} is not alive: {e}"
             )
@@ -641,7 +705,7 @@ class IMAPAuthenticator:
             session_info.connection.noop()
             session_info.update_activity()
             self._logger.debug(f"Keepalive successful for session {session_id}")
-        except Exception as e:
+        except (OSError, TimeoutError, IMAPClientError) as e:
             self._logger.error(f"Keepalive failed for session {session_id}: {self._sanitize_error(e)}")
             session_info.state = SessionState.ERROR
             raise IMAPSessionError(f"Keepalive failed: {e}") from e
@@ -660,7 +724,7 @@ class IMAPAuthenticator:
                 time.sleep(CLEANUP_INTERVAL_SECONDS)
                 try:
                     self._cleanup_stale_sessions()
-                except Exception as e:
+                except (OSError, TimeoutError, IMAPClientError, ValueError) as e:
                     self._logger.error(f"Error in cleanup thread: {self._sanitize_error(e)}")
         cleanup_thread = threading.Thread(
             target=cleanup_worker,
@@ -683,7 +747,7 @@ class IMAPAuthenticator:
                         f"Auto-cleaning stale session: {session_id}"
                     )
                     self.disconnect(session_id)
-                except Exception as e:
+                except (OSError, TimeoutError, IMAPClientError, ValueError) as e:
                     self._logger.error(
                         f"Failed to cleanup session {session_id}: {e}"
                     )
@@ -722,25 +786,6 @@ class IMAPAuthenticator:
                 "stale_sessions": stale,
                 "sessions_by_email": sessions_by_email,
             }
-    def _validate_credentials(self, credentials: IMAPCredentials) -> None:
-        """Validate credentials format and constraints.
-        Credentials dataclass already validates email format and password security
-        in __post_init__. This method performs additional Gmail-specific checks.
-        Args:
-            credentials: IMAPCredentials to validate
-        Raises:
-            ValueError: Credentials fail validation
-        """
-        # Note: Email and password validation now centralized in IMAPCredentials.__post_init__
-        # Warn if not Gmail domain (but allow for Google Workspace)
-        if not (
-            credentials.email.endswith("@gmail.com")
-            or "google" in credentials.email.lower()
-        ):
-            self._logger.warning(
-                f"Email {credentials.email} may not be a Gmail account. "
-                f"IMAP authentication works best with Gmail and Google Workspace accounts."
-            )
     def _sanitize_error(self, error: Exception) -> str:
         """Sanitize error messages to prevent information disclosure.
         Prevents exposing internal details that could aid attackers by

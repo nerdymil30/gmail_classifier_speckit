@@ -145,6 +145,82 @@ class TestFolderListing:
 
         assert folders == []
 
+    def test_list_folders_force_refresh_bypasses_cache(self, mock_imap_session) -> None:
+        """T033: Test list_folders() force_refresh bypasses cache.
+
+        Validates:
+        - force_refresh=True bypasses cache
+        - IMAPClient.list_folders called on each force refresh
+        - Cached results ignored when force_refresh=True
+
+        Expected outcome: Server called on each force refresh
+        """
+        from gmail_classifier.email.fetcher import FolderManager
+
+        authenticator, session_info, mock_client = mock_imap_session
+
+        mock_client.list_folders.return_value = [
+            ((b"\\HasNoChildren",), b"/", "INBOX"),
+        ]
+
+        folder_manager = FolderManager(authenticator)
+
+        # First call (cached)
+        folders1 = folder_manager.list_folders(session_info.session_id)
+
+        # Second call with force_refresh=True (bypasses cache)
+        folders2 = folder_manager.list_folders(session_info.session_id, force_refresh=True)
+
+        # Third call with force_refresh=True (bypasses cache again)
+        folders3 = folder_manager.list_folders(session_info.session_id, force_refresh=True)
+
+        # Assert
+        assert folders1 == folders2 == folders3
+        # list_folders should be called three times (force refresh twice)
+        assert mock_client.list_folders.call_count == 3
+
+    def test_list_folders_cache_expires_after_ttl(self, mock_imap_session) -> None:
+        """T033: Test list_folders() cache expires after TTL.
+
+        Validates:
+        - Cache expires after 10 minutes TTL
+        - Fresh data fetched when cache is stale
+        - is_stale() method correctly identifies stale cache
+
+        Expected outcome: Cache refreshed after TTL expires
+        """
+        from datetime import datetime, timedelta
+        from unittest.mock import patch
+
+        from gmail_classifier.email.fetcher import FolderManager
+
+        authenticator, session_info, mock_client = mock_imap_session
+
+        mock_client.list_folders.return_value = [
+            ((b"\\HasNoChildren",), b"/", "INBOX"),
+        ]
+
+        folder_manager = FolderManager(authenticator)
+
+        # First call (cached)
+        folders1 = folder_manager.list_folders(session_info.session_id)
+        assert mock_client.list_folders.call_count == 1
+
+        # Second call (should use cache)
+        folders2 = folder_manager.list_folders(session_info.session_id)
+        assert mock_client.list_folders.call_count == 1  # Still 1, used cache
+
+        # Simulate cache expiration by manually setting created_at to 11 minutes ago
+        cache_entry = folder_manager._folder_cache[session_info.session_id]
+        cache_entry.created_at = datetime.now() - timedelta(minutes=11)
+
+        # Third call (cache should be stale, refetch)
+        folders3 = folder_manager.list_folders(session_info.session_id)
+        assert mock_client.list_folders.call_count == 2  # Refetched due to stale cache
+
+        # All results should be equal
+        assert folders1 == folders2 == folders3
+
 
 # ============================================================================
 # T034: Test Folder Selection

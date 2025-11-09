@@ -4,6 +4,7 @@ priority: p3
 issue_id: "027"
 tags: [code-quality, duplication, imap]
 dependencies: []
+resolved_date: 2025-11-09
 ---
 
 # Duplicated Validation Logic

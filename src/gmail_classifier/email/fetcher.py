@@ -169,7 +169,7 @@ class FolderManager:
 
         self._logger.info("FolderManager initialized")
 
-    def list_folders(self, session_id: uuid.UUID) -> list[EmailFolder]:
+    def list_folders(self, session_id: uuid.UUID, force_refresh: bool = False) -> list[EmailFolder]:
         """List all IMAP folders (Gmail labels) for the session.
 
         Retrieves and parses folder list from IMAP server. Results are cached
@@ -177,6 +177,7 @@ class FolderManager:
 
         Args:
             session_id: UUID of active IMAP session
+            force_refresh: If True, bypass cache and fetch fresh data (default: False)
 
         Returns:
             List of EmailFolder objects
@@ -185,14 +186,16 @@ class FolderManager:
             ValueError: Session not found
             IMAPSessionError: IMAP operation failed
         """
-        # Check cache first
-        if session_id in self._folder_cache:
+        # Check cache first (unless force refresh requested)
+        if not force_refresh and session_id in self._folder_cache:
             cache_entry = self._folder_cache[session_id]
             if not cache_entry.is_stale():
                 self._logger.debug(f"Returning cached folders for session {session_id}")
                 return cache_entry.data
             else:
                 self._logger.debug(f"Cache stale for session {session_id}, refreshing")
+        elif force_refresh:
+            self._logger.debug(f"Force refresh requested for session {session_id}")
 
         # Get session
         session_info = self._authenticator.get_session(session_id)
